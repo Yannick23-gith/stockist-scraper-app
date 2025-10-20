@@ -55,6 +55,9 @@ def scrape():
         flash(f"Erreur: {e}", "error")
         return redirect(url_for("index"))
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
 
 if __name__ == "__main__":
     # Render injecte PORT ; si non présent, on tombe sur 8000
