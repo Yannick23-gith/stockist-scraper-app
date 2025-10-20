@@ -8,9 +8,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copie le code
 COPY . /app
 
-# Expose & PORT
+# (fin du Dockerfile)
 ENV PORT=8000
+ENV WEB_CONCURRENCY=1        # 1 worker = moins de RAM
 EXPOSE 8000
 
-# 🚀 Lance Gunicorn (le Procfile est ignoré en mode Docker)
-CMD gunicorn -w 2 -k gthread -t 300 -b 0.0.0.0:${PORT} app:app
+# Gunicorn robuste au cold start (300s)
+CMD ["gunicorn", "-w", "1", "-k", "gthread", "-t", "300", "-b", "0.0.0.0:${PORT}", "app:app"]
