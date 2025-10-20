@@ -33,12 +33,15 @@ def scrape():
         return redirect(url_for("index"))
     try:
         results = scrape_stockist(url)
-        # Générer le CSV en mémoire
+        # Log utile dans les logs Render
+        print(f"[SCRAPER] {len(results)} magasins trouvés pour {url}")
+        if not results:
+            flash("Aucun point de vente détecté. Réessaie dans 10–15s (réveil de l’instance) ou vérifie l’URL.", "error")
+            return redirect(url_for("index"))
+
+        import io, csv
         output = io.StringIO()
-        writer = csv.DictWriter(
-            output,
-            fieldnames=["name","address_full","street","city","postal_code","country","url"]
-        )
+        writer = csv.DictWriter(output, fieldnames=["name","address_full","street","city","postal_code","country","url"])
         writer.writeheader()
         for row in results:
             writer.writerow(row)
@@ -51,6 +54,7 @@ def scrape():
     except Exception as e:
         flash(f"Erreur: {e}", "error")
         return redirect(url_for("index"))
+
 
 if __name__ == "__main__":
     # Render injecte PORT ; si non présent, on tombe sur 8000
