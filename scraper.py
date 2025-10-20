@@ -1,150 +1,133 @@
 # -*- coding: utf-8 -*-
 from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
-import re
+import re, time, json
 
-NAV_TIMEOUT = 90000
-WAIT_SELECTORS_MS = 60000
-LIST_SELECTORS = [".st-list", ".stockist-list", "[class*='st-list__container']"]
-ITEM_SELECTORS = [".st-list__item", ".stockist-location", "[class*='st-list__item']", "[data-testid='location-list-item']"]
-NAME_SELECTORS = [".st-list__name", ".stockist-location__name", "[class*='name']"]
-ADDR_SELECTORS = [".st-list__address", ".stockist-location__address", "address", "[class*='address']"]
-URL_SELECTORS  = ["a[href*='http']:not([href*='google'])", "a[href^='http']"]
+NAV_TIMEOUT = 120_000
+CAPTURE_WINDOW_MS = 20_000   # temps pour intercepter la réponse JSON
 
-def _split_address(text: str):
-    if not text: return "", "", "", "", ""
-    t = re.sub(r"\s+", " ", text).strip(" ,;\n\t")
-    street = city = postal = country = ""
-    m = re.search(r"(\b\d{4,5}\b)", t)
-    if m: postal = m.group(1)
-    parts = [p.strip() for p in re.split(r"[,\.;]\s*", t) if p.strip()]
-    if parts:
-        last = parts[-1].lower()
-        if any(k in last for k in ["france","belgique","suisse","italie","spain","espagne","portugal","germany","allemagne","uk","united kingdom","ireland","pays-bas","netherlands"]):
-            country = parts.pop(-1)
-    if postal:
-        for p in parts[::-1]:
-            if postal in p:
-                city = p.replace(postal, "").strip(" ,"); break
-    if not city and len(parts) >= 2: city = parts[-1]
-    if parts: street = parts[0]
-    return t, street, city, postal, country
+def _norm(s): 
+    return (s or "").strip()
 
-def _parse_items(html: str):
-    soup = BeautifulSoup(html, "lxml")
-    list_node = None
-    for sel in LIST_SELECTORS:
-        list_node = soup.select_one(sel)
-        if list_node: break
-    scope = list_node or soup
-    items = []
-    for item_sel in ITEM_SELECTORS:
-        for it in scope.select(item_sel):
-            name = None
-            for ns in NAME_SELECTORS:
-                el = it.select_one(ns)
-                if el and el.get_text(strip=True):
-                    name = el.get_text(" ", strip=True); break
-            if not name:
-                fb = it.select_one("h3, h2, strong")
-                if fb: name = fb.get_text(" ", strip=True)
-            addr = None
-            for asel in ADDR_SELECTORS:
-                ael = it.select_one(asel)
-                if ael and ael.get_text(strip=True):
-                    addr = ael.get_text(" ", strip=True); break
-            url = ""
-            for us in URL_SELECTORS:
-                link = it.select_one(us)
-                if link and link.has_attr("href"):
-                    url = link["href"]; break
-            if name or addr or url:
-                full, street, city, cp, country = _split_address(addr or "")
-                items.append({
-                    "name": name or "",
-                    "address_full": full,
-                    "street": street,
-                    "city": city,
-                    "postal_code": cp,
-                    "country": country,
-                    "url": url
-                })
-    # dedup
-    seen, uniq = set(), []
-    for d in items:
-        key = (d["name"].lower(), d["address_full"].lower())
-        if key in seen: continue
-        seen.add(key); uniq.append(d)
-    return uniq
+def _mk_row(loc: dict):
+    # essaie différents schémas courants renvoyés par Stockist
+    name   = loc.get("name") or loc.get("title") or loc.get("store_name") or ""
+    addr1  = loc.get("address1") or loc.get("street") or loc.get("address_line_1") or ""
+    addr2  = loc.get("address2") or loc.get("address_line_2") or ""
+    city   = loc.get("city") or ""
+    state  = loc.get("state") or loc.get("province") or ""
+    postal = loc.get("postal_code") or loc.get("postcode") or loc.get("zip") or ""
+    country= loc.get("country") or loc.get("country_code") or ""
+    website= loc.get("website") or loc.get("url") or ""
 
-def _try_accept_cookies(page_like):
-    sels = [
-        "button:has-text('Tout accepter')", "button:has-text('Accepter')",
-        "#onetrust-accept-btn-handler", "button#didomi-notice-agree-button",
-        "button:has-text(\"J’accepte\")", "button:has-text('Accept all')"
-    ]
-    for s in sels:
-        try:
-            el = page_like.locator(s)
-            if el and el.is_visible(): el.click()
-        except Exception:
-            pass
+    # adresse pleine
+    address_full = ", ".join([_norm(x) for x in [addr1, addr2, postal and f"{postal} {city}" or city, state, country] if _norm(x)])
 
-def _load_all_locations(page_like):
-    for _ in range(15):
-        try:
-            btn = page_like.locator("button:has-text('Load more'), button:has-text('Voir plus'), .st-list__load-more button")
-            if btn and btn.is_visible(): btn.click()
-            else: break
-        except Exception:
-            break
-    last = 0
-    for _ in range(25):
-        try: page_like.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception: break
-        page_like.wait_for_timeout(300)
-        try: h = page_like.evaluate("document.body.scrollHeight")
-        except Exception: break
-        if h == last: break
-        last = h
+    return {
+        "name": _norm(name),
+        "address_full": address_full,
+        "street": _norm(addr1),
+        "city": _norm(city),
+        "postal_code": _norm(postal),
+        "country": _norm(country),
+        "url": _norm(website),
+    }
 
 def scrape_stockist(url: str):
+    """
+    Stratégie:
+    1) Aller sur la page (sans attendre 'networkidle')
+    2) Intercepter les réponses réseau provenant de stocki.st / stockist.* contenant du JSON
+    3) Extraire la liste des magasins depuis ce JSON
+    4) Fallback (si rien intercepté) : tenter une requête XHR lancée par le widget via le contenu de la frame
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"],
         )
         context = browser.new_context(
             locale="fr-FR",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36")
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123 Safari/537.36")
         )
         page = context.new_page()
         page.set_default_navigation_timeout(NAV_TIMEOUT)
         page.set_default_timeout(NAV_TIMEOUT)
 
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        _try_accept_cookies(page)
+        captured = {"items": []}
 
-        frame = None
-        try:
-            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
-        except Exception:
-            for f in page.frames:
-                try:
-                    if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
-                        frame = f; break
-                except Exception:
-                    pass
-            if frame:
-                _try_accept_cookies(frame)
-                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
+        def handle_response(resp):
+            try:
+                u = resp.url.lower()
+                ct = resp.headers.get("content-type","").lower()
+                if ("stocki.st" in u or "stockist" in u) and ("json" in ct or u.endswith(".json")):
+                    data = resp.json()
+                    # différentes formes possibles
+                    candidates = []
+                    if isinstance(data, dict):
+                        for k in ("locations","results","stores","items","data","payload"):
+                            if k in data:
+                                candidates.append(data[k])
+                    if isinstance(data, list):
+                        candidates.append(data)
+                    # aplatis
+                    out = []
+                    for c in candidates:
+                        if isinstance(c, list):
+                            out.extend(c)
+                        elif isinstance(c, dict):
+                            # parfois data -> locations
+                            for k in ("locations","results","stores","items"):
+                                if k in c and isinstance(c[k], list):
+                                    out.extend(c[k])
+                    if out:
+                        captured["items"] = out
+            except Exception:
+                pass
 
-        target = frame if frame else page
-        _load_all_locations(target)
+        # écouter TOUT le contexte (réponses venant aussi des iframes)
+        context.on("response", handle_response)
 
-        html = target.content()
+        # aller sur la page
+        page.goto(url, wait_until="domcontentloaded")
+
+        # attendre un peu que le widget charge et émette la requête
+        t0 = time.time()
+        while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not captured["items"]:
+            page.wait_for_timeout(300)
+
+        # si toujours rien, essayer de trouver la frame stockist et forcer un petit scroll
+        if not captured["items"]:
+            try:
+                target = None
+                for f in page.frames:
+                    u = (f.url or "").lower()
+                    if "stocki.st" in u or "stockist" in u or "stockist.co" in u:
+                        target = f; break
+                if target:
+                    for _ in range(10):
+                        try:
+                            target.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            page.wait_for_timeout(200)
+                        except Exception:
+                            break
+                    # patienter encore un peu pour intercepter la requête JSON
+                    t1 = time.time()
+                    while (time.time() - t1) * 1000 < CAPTURE_WINDOW_MS and not captured["items"]:
+                        page.wait_for_timeout(300)
+            except Exception:
+                pass
+
         browser.close()
 
-    results = _parse_items(html)
-    print(f"[SCRAPER] {len(results)} magasins parsés")
-    return results
+    # Conversion
+    rows = []
+    for loc in captured["items"]:
+        try:
+            rows.append(_mk_row(loc))
+        except Exception:
+            continue
+
+    # log dans Render
+    print(f"[SCRAPER] {len(rows)} magasins capturés via JSON")
+    return rows
