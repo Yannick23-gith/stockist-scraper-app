@@ -112,38 +112,44 @@ def _load_all_locations(page_like):
 
 def scrape_stockist(url: str):
     with sync_playwright() as p:
-browser = p.chromium.launch(
-    headless=True,
-    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"]
-)
-
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote"
+            ]
+        )
         context = browser.new_context(
             locale="fr-FR",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123 Safari/537.36"
+            )
         )
         page = context.new_page()
-        page.set_default_navigation_timeout(NAV_TIMEOUT)
-        page.set_default_timeout(NAV_TIMEOUT)
+        page.set_default_navigation_timeout(90000)
+        page.set_default_timeout(90000)
 
-        # ⚠️ ne plus attendre 'networkidle' (sources analytics empêchent l'idle)
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        # Charger la page
+        page.goto(url, wait_until="domcontentloaded", timeout=90000)
         _try_accept_cookies(page)
 
-        # tente d'abord sur la page principale
+        # Attendre la liste
         frame = None
         try:
-            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
+            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=60000)
         except Exception:
-            # si rien, on cherche une iframe Stockist
             for f in page.frames:
-                try:
-                    if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
-                        frame = f; break
-                except Exception:
-                    pass
+                if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
+                    frame = f
+                    break
             if frame:
                 _try_accept_cookies(frame)
-                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
+                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=60000)
 
         target = frame if frame else page
         _load_all_locations(target)
