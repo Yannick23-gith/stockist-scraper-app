@@ -13,4 +13,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # 🚀 Lance Gunicorn (le Procfile est ignoré en mode Docker)
-CMD gunicorn -w 2 -k gthread -t 240 -b 0.0.0.0:${PORT} app:app
+CMD gunicorn -w 2 -k gthread -t 300 -b 0.0.0.0:${PORT} app:app
