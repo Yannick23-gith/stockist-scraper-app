@@ -8,10 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copie le code
 COPY . /app
 
-# (fin du Dockerfile)
+# --- fin du Dockerfile ---
+
 ENV PORT=8000
-ENV WEB_CONCURRENCY=1        # 1 worker = moins de RAM
+ENV WEB_CONCURRENCY=1
 EXPOSE 8000
 
-# Gunicorn robuste au cold start (300s)
-CMD ["gunicorn", "-w", "1", "-k", "gthread", "-t", "300", "-b", "0.0.0.0:${PORT}", "app:app"]
+# Lancer Gunicorn (forme shell pour que $PORT soit expandé)
+CMD bash -lc 'gunicorn -w $WEB_CONCURRENCY -k gthread -t 300 -b 0.0.0.0:$PORT app:app'
