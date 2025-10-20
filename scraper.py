@@ -3,7 +3,7 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import re
 
-NAV_TIMEOUT = 90000      # 90s pour laisser le temps au réveil/render
+NAV_TIMEOUT = 90000
 WAIT_SELECTORS_MS = 60000
 LIST_SELECTORS = [".st-list", ".stockist-list", "[class*='st-list__container']"]
 ITEM_SELECTORS = [".st-list__item", ".stockist-location", "[class*='st-list__item']", "[data-testid='location-list-item']"]
@@ -91,7 +91,6 @@ def _try_accept_cookies(page_like):
             pass
 
 def _load_all_locations(page_like):
-    # “Load more” / “Voir plus”
     for _ in range(15):
         try:
             btn = page_like.locator("button:has-text('Load more'), button:has-text('Voir plus'), .st-list__load-more button")
@@ -99,7 +98,6 @@ def _load_all_locations(page_like):
             else: break
         except Exception:
             break
-    # auto-scroll
     last = 0
     for _ in range(25):
         try: page_like.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -114,42 +112,32 @@ def scrape_stockist(url: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-                "--no-zygote"
-            ]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"]
         )
         context = browser.new_context(
             locale="fr-FR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123 Safari/537.36"
-            )
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36")
         )
         page = context.new_page()
-        page.set_default_navigation_timeout(90000)
-        page.set_default_timeout(90000)
+        page.set_default_navigation_timeout(NAV_TIMEOUT)
+        page.set_default_timeout(NAV_TIMEOUT)
 
-        # Charger la page
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         _try_accept_cookies(page)
 
-        # Attendre la liste
         frame = None
         try:
-            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=60000)
+            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
         except Exception:
             for f in page.frames:
-                if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
-                    frame = f
-                    break
+                try:
+                    if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
+                        frame = f; break
+                except Exception:
+                    pass
             if frame:
                 _try_accept_cookies(frame)
-                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=60000)
+                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
 
         target = frame if frame else page
         _load_all_locations(target)
@@ -157,4 +145,6 @@ def scrape_stockist(url: str):
         html = target.content()
         browser.close()
 
-    return _parse_items(html)
+    results = _parse_items(html)
+    print(f"[SCRAPER] {len(results)} magasins parsés")
+    return results
