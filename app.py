@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from flask import Flask, render_template, request, Response, send_file, redirect, url_for, flash
+import os
 import io
 import csv
+from flask import Flask, render_template, request, Response, redirect, url_for, flash
+from jinja2 import TemplateNotFound
 from scraper import scrape_stockist
 
-app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# On force le dossier des templates pour éviter tout souci de résolution
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
 app.secret_key = "change-this"
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template("index.html")
+    try:
+        return render_template("index.html")
+    except TemplateNotFound:
+        # Fallback au cas où le template n'est pas trouvé
+        return (
+            "<h1>Stockist Scraper</h1>"
+            "<p>Form POST → <code>/scrape</code> avec <code>url=https://…</code></p>",
+            200,
+        )
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
@@ -20,23 +33,26 @@ def scrape():
         return redirect(url_for("index"))
     try:
         results = scrape_stockist(url)
-        # build CSV in-memory
+        # Générer le CSV en mémoire
         output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["name","address_full","street","city","postal_code","country","url"])
+        writer = csv.DictWriter(
+            output,
+            fieldnames=["name","address_full","street","city","postal_code","country","url"]
+        )
         writer.writeheader()
         for row in results:
             writer.writerow(row)
         output.seek(0)
-        filename = "stores.csv"
         return Response(
             output.getvalue(),
             mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={"Content-Disposition": "attachment; filename=stores.csv"}
         )
     except Exception as e:
-        # show error on page
         flash(f"Erreur: {e}", "error")
         return redirect(url_for("index"))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    # Render injecte PORT ; si non présent, on tombe sur 8000
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
