@@ -1,29 +1,19 @@
-# Use Python base
-FROM python:3.11-slim
+# Image officielle Playwright + Python + navigateurs (Chromium déjà prêt)
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# Prevent interactive tzdata
-ENV DEBIAN_FRONTEND=noninteractive
-
-# System deps for Playwright
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg ca-certificates curl unzip fonts-liberation libnss3 libatk1.0-0 libatk-bridge2.0-0 \
-    libdrm2 libxkbcommon0 libgtk-3-0 libasound2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-    libgbm1 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# App dir
+# Dossier de l'app
 WORKDIR /app
 
-# Copy files
+# Dépendances Python
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install browsers for Playwright
-RUN python -m playwright install --with-deps chromium
-
+# Code
 COPY . /app
 
+# Port Flask
 ENV PORT=8000
 EXPOSE 8000
 
+# Lancer l'app
 CMD ["python", "app.py"]
