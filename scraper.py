@@ -112,7 +112,11 @@ def _load_all_locations(page_like):
 
 def scrape_stockist(url: str):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+browser = p.chromium.launch(
+    headless=True,
+    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"]
+)
+
         context = browser.new_context(
             locale="fr-FR",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
