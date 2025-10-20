@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-import re, time
+import re
 
-WAIT_MS = 30000
-
+NAV_TIMEOUT = 90000      # 90s pour laisser le temps au réveil/render
+WAIT_SELECTORS_MS = 60000
 LIST_SELECTORS = [".st-list", ".stockist-list", "[class*='st-list__container']"]
 ITEM_SELECTORS = [".st-list__item", ".stockist-location", "[class*='st-list__item']", "[data-testid='location-list-item']"]
 NAME_SELECTORS = [".st-list__name", ".stockist-location__name", "[class*='name']"]
@@ -25,8 +25,7 @@ def _split_address(text: str):
     if postal:
         for p in parts[::-1]:
             if postal in p:
-                city = p.replace(postal, "").strip(" ,")
-                break
+                city = p.replace(postal, "").strip(" ,"); break
     if not city and len(parts) >= 2: city = parts[-1]
     if parts: street = parts[0]
     return t, street, city, postal, country
@@ -79,85 +78,73 @@ def _parse_items(html: str):
     return uniq
 
 def _try_accept_cookies(page_like):
-    # clique sur les boutons cookies les plus courants
-    selectors = [
+    sels = [
         "button:has-text('Tout accepter')", "button:has-text('Accepter')",
         "#onetrust-accept-btn-handler", "button#didomi-notice-agree-button",
-        "button:has-text('J’accepte')", "button:has-text('Accept all')"
+        "button:has-text(\"J’accepte\")", "button:has-text('Accept all')"
     ]
-    for sel in selectors:
+    for s in sels:
         try:
-            el = page_like.locator(sel)
-            if el and el.is_visible():
-                el.click()
-                page_like.wait_for_timeout(300)
+            el = page_like.locator(s)
+            if el and el.is_visible(): el.click()
         except Exception:
             pass
 
 def _load_all_locations(page_like):
-    # cliquer sur "Load more" / "Voir plus"
+    # “Load more” / “Voir plus”
     for _ in range(15):
         try:
             btn = page_like.locator("button:has-text('Load more'), button:has-text('Voir plus'), .st-list__load-more button")
-            if btn and btn.is_visible():
-                btn.click(); page_like.wait_for_timeout(600)
-            else:
-                break
+            if btn and btn.is_visible(): btn.click()
+            else: break
         except Exception:
             break
-    # autoscroll pour lazy-load
-    last_h = 0
+    # auto-scroll
+    last = 0
     for _ in range(25):
-        try:
-            page_like.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        except Exception:
-            # frames sans window.scrollTo
-            pass
-        page_like.wait_for_timeout(400)
-        try:
-            h = page_like.evaluate("document.body.scrollHeight")
-        except Exception:
-            break
-        if h == last_h: break
-        last_h = h
+        try: page_like.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception: break
+        page_like.wait_for_timeout(300)
+        try: h = page_like.evaluate("document.body.scrollHeight")
+        except Exception: break
+        if h == last: break
+        last = h
 
 def scrape_stockist(url: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="fr-FR", user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36")
+        context = browser.new_context(
+            locale="fr-FR",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+        )
         page = context.new_page()
-        page.set_default_timeout(45000)
+        page.set_default_navigation_timeout(NAV_TIMEOUT)
+        page.set_default_timeout(NAV_TIMEOUT)
 
-        page.goto(url, wait_until="networkidle", timeout=45000)
+        # ⚠️ ne plus attendre 'networkidle' (sources analytics empêchent l'idle)
+        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         _try_accept_cookies(page)
 
-        # Attente d’éléments Stockist en page ou dans une iframe
-        found = False
-        try:
-            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_MS)
-            found = True
-        except Exception:
-            pass
-
+        # tente d'abord sur la page principale
         frame = None
-        if not found:
-            # Cherche une iframe stockist
-            try:
-                for f in page.frames:
+        try:
+            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
+        except Exception:
+            # si rien, on cherche une iframe Stockist
+            for f in page.frames:
+                try:
                     if f.url and ("stocki.st" in f.url or "stockist" in f.url or "stockist.co" in f.url):
                         frame = f; break
-                if frame:
-                    _try_accept_cookies(frame)
-                    frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_MS)
-                    found = True
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            if frame:
+                _try_accept_cookies(frame)
+                frame.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_SELECTORS_MS)
 
-        # Charger tout
         target = frame if frame else page
         _load_all_locations(target)
 
-        html = (frame.content() if frame else page.content())
+        html = target.content()
         browser.close()
 
     return _parse_items(html)
