@@ -3,7 +3,8 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import time, re
 
-WAIT_MS = 12000
+# ↑ monte l'attente max à 30s (Stockist peut être lent au réveil Render)
+WAIT_MS = 30000
 
 LIST_SELECTORS = [".st-list", ".stockist-list", "[class*='st-list__container']"]
 ITEM_SELECTORS = [".st-list__item", ".stockist-location", "[class*='st-list__item']", "[data-testid='location-list-item']"]
@@ -89,19 +90,50 @@ def _parse_items(html: str):
         uniq.append(d)
     return uniq
 
+def _load_all_locations(page):
+    """Scroll + clique sur 'Load more'/'Voir plus' si présent, pour tout charger."""
+    # essaie de cliquer plusieurs fois sur un bouton "load more"
+    for _ in range(10):
+        try:
+            btn = page.locator("button:has-text('Load more'), button:has-text('Voir plus'), .st-list__load-more button")
+            if btn and btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(500)
+            else:
+                break
+        except Exception:
+            break
+
+    # auto-scroll pour forcer le lazy-load
+    last_h = 0
+    for _ in range(20):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(400)
+        h = page.evaluate("document.body.scrollHeight")
+        if h == last_h:
+            break
+        last_h = h
+
 def scrape_stockist(url: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        found = False
-        start = time.time()
-        while (time.time() - start) * 1000 < WAIT_MS:
-            html = page.content()
-            if any(s in html for s in ["st-list__item", "stockist-location", "st-list__name"]):
-                found = True
-                break
-            page.wait_for_timeout(300)
+        # user agent "classique" pour éviter certains blocks
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36")
+        page = context.new_page()
+        page.set_default_timeout(45000)
+
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+        # Attendre que le widget ou la liste apparaisse
+        try:
+            page.wait_for_selector(".st-list__item, .stockist-location, .st-list", timeout=WAIT_MS)
+        except Exception:
+            # si pas visible, attendre un peu puis continuer quand même (on analysera le HTML)
+            page.wait_for_timeout(1500)
+
+        # Charger tout (scroll, load more)
+        _load_all_locations(page)
+
         html = page.content()
         browser.close()
     return _parse_items(html)
