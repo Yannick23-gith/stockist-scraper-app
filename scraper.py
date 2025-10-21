@@ -61,39 +61,70 @@ def _extract_store_id_from_html(html: str) -> Optional[str]:
     return None
 
 
-def _extract_store_id(input_value: str) -> (str, Optional[str]):
-    """
-    Retourne (store_id, referer) à partir d'une URL de store locator OU d'un store_id.
-    """
-    s = input_value.strip()
-    if _is_digits(s):
-        return s, None
+import re
+import requests
 
-    # Si on nous passe une URL de la forme ?store=12345 dans la query string, récupère directement
-    qs_id = None
+UA = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+}
+
+def _extract_store_id(input_value: str) -> tuple[str, str | None]:
+    """
+    Retourne (store_id, referer).
+    - Si l'entrée est déjà un ID numérique -> on le renvoie direct.
+    - Sinon on télécharge la page et on cherche le store_id dans plein d'endroits possibles.
+    """
+    input_value = (input_value or "").strip()
+
+    # 1) Si c’est déjà un ID (ex: "53141635251")
+    if re.fullmatch(r"\d{5,}", input_value):
+        return input_value, None
+
+    # 2) Sinon, on considère que c'est une URL — on récupère l'HTML
     try:
-        parsed = urlparse.urlsplit(s)
-        qs = urlparse.parse_qs(parsed.query)
-        if "store" in qs and qs["store"] and _is_digits(qs["store"][0]):
-            qs_id = qs["store"][0]
-    except Exception:
-        pass
+        resp = requests.get(input_value, headers=UA, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Impossible de charger l'URL fournie : {e}")
 
-    if qs_id:
-        return qs_id, s
+    html = resp.text
 
-    # Sinon, on télécharge le HTML pour détecter l'ID
-    logger.info("[SCRAPER] Fetch page to extract store_id: %s", s)
-    resp = _http_get(s, referer=s)
-    if not resp.ok:
-        raise RuntimeError(f"Impossible de charger la page ({resp.status_code}).")
+    # 3) Tous les patterns plausibles rencontrés sur les intégrations Stockist
+    patterns = [
+        # Attributs data-*
+        r'data-stockist-store=["\'](\d+)["\']',
+        r'data-stockist_store_id=["\'](\d+)["\']',
+        r'data-store-id=["\'](\d+)["\']',
 
-    store_id = _extract_store_id_from_html(resp.text)
-    if not store_id:
-        raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
+        # Variables JS usuelles
+        r'stockist_store_id\s*[:=]\s*["\']?(\d+)',
+        r'storeId\s*[:=]\s*["\']?(\d+)',
+        r'stockist\s*=\s*{[^}]*store_id\s*:\s*(\d+)',
+        r'stockistSettings\s*=\s*{[^}]*store_id\s*:\s*(\d+)',
+        r'window\.stockistConfig\s*=\s*{[^}]*store_id\s*[:=]\s*["\']?(\d+)',
 
-    logger.info("[SCRAPER] store_id=%s", store_id)
-    return store_id, s
+        # URLs d’API/iframe/script où l’ID est présent
+        r'stockist-api\.stockist\.co/[^"\']*?/(\d+)/locations',
+        r'stockist\.co/[^"\']*?/(\d+)/locations',
+        r'stockist\.co/[^"\']*?store_id=(\d+)',
+        r'storelocator\.stockist\.co/[^"\']*?store_id=(\d+)',
+        r'embed\.js[^"\']*?(?:\?|&)store_id=(\d+)',
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, html, re.I | re.S)
+        if m:
+            store_id = m.group(1)
+            return store_id, input_value  # referer = la page d’origine
+
+    # 4) Dernier recours : regarder tous les <script src="…"> et iframes
+    #    -> parfois l’ID n’est visible que dans l’URL des assets
+    m = re.search(r'<(?:script|iframe)[^>]+src=["\'][^"\']*(?:store_id|storeId)=(\d+)', html, re.I)
+    if m:
+        return m.group(1), input_value
+
+    raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
+
 
 
 def _normalize_item(it: Dict[str, Any]) -> Dict[str, Any]:
