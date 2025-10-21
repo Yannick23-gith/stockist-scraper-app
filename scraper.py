@@ -76,6 +76,14 @@ def _parse_json_or_jsonp(resp):
     return False, None
 
 def scrape_stockist(url: str):
+    """
+    Stratégie robuste :
+      A) Essayer de détecter l'ID de boutique Stockist dans le HTML
+         (data-stockist-store, configs embarquées...)
+         Puis paginer via l'API officielle : .../api/stores/{store_id}/locations
+      B) Si on ne trouve pas l'ID, fallback sur l'ancienne méthode :
+         on écoute les réponses réseau et on reconstruit la pagination.
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -91,125 +99,188 @@ def scrape_stockist(url: str):
         page.set_default_navigation_timeout(NAV_TIMEOUT)
         page.set_default_timeout(NAV_TIMEOUT)
 
-        first_json_url = {"url": None}
-        stockist_candidates = []
-
-        def handle_response(resp):
-            try:
-                u = (resp.url or "")
-                lu = u.lower()
-                if ("stockist" in lu or "stocki.st" in lu):
-                    ct = resp.headers.get('content-type','')
-                    print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={ct}")
-                    stockist_candidates.append(u)
-                    # première URL exploitable
-                    if first_json_url["url"] is None and any(k in lu for k in ("location","store","graphql","api","search")):
-                        first_json_url["url"] = u
-                        print(f"[SCRAPER] first JSON URL (candidate): {u}")
-            except Exception:
-                pass
-
-        context.on("response", handle_response)
-
-        # 1) ouvrir la page
+        # -----------------------
+        # A) Tenter HTML -> store_id
+        # -----------------------
         page.goto(url, wait_until="domcontentloaded")
 
-        # 2) laisser partir les requêtes
-        t0 = time.time()
-        while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
-            page.wait_for_timeout(250)
-
-        # 3) stimuler une éventuelle iframe stockist
-        if not first_json_url["url"]:
-            try:
-                for f in page.frames:
-                    uu = (f.url or "").lower()
-                    if "stockist" in uu or "stocki.st" in uu:
-                        for _ in range(12):
-                            try:
-                                f.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                page.wait_for_timeout(180)
-                            except Exception:
-                                break
-                        t1 = time.time()
-                        while (time.time() - t1) * 1000 < 5000 and not first_json_url["url"]:
-                            page.wait_for_timeout(250)
-                        break
-            except Exception:
-                pass
+        store_id = None
+        try:
+            # 1) Attributs data-stockist-* usuels
+            html = page.content()
+            # data-stockist-store="12345"
+            m = re.search(r'data-stockist-store=["\'](\d+)["\']', html, flags=re.I)
+            if not m:
+                # certaines intégrations mettent l'id directement sur un container
+                m = re.search(r'"store_id"\s*:\s*(\d+)', html, flags=re.I)
+            if not m:
+                # cas JSON embarqué : window.stockistConfig = { store_id: 12345, ... }
+                m = re.search(r'stockist[^=]*=\s*{[^}]*store[_\s]*id["\']?\s*[:=]\s*("?)(\d+)\1', html, flags=re.I)
+            if m:
+                store_id = m.group(1) if m.lastindex == 1 else (m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0))
+                if isinstance(store_id, str) and not store_id.isdigit():
+                    # si group(1) était le guillemet, reprendre l'autre groupe
+                    try:
+                        store_id = m.group(2)
+                    except Exception:
+                        pass
+                print(f"[SCRAPER] store_id trouvé dans HTML: {store_id}")
+        except Exception:
+            pass
 
         rows = []
 
-        def try_paginate_from(base_url: str):
-            """Essaie de paginer sur base_url en ajoutant page & per_page."""
+        def api_paginate_store(store_id_val: str):
+            """Pagine via endpoints officiels Stockist pour un store_id donné."""
             local_rows = []
             api = context.request
-            base = base_url
-            if "page=" not in base:
-                base = _set_query_param(base, "page", 1)
-            base = _set_query_param(base, "per_page", 100)
-            page_num = 1
+
+            # Endpoints les plus courants (on en teste plusieurs)
+            endpoints = [
+                f"https://app.stockist.co/api/stores/{store_id_val}/locations",
+                f"https://stocki.st/api/stores/{store_id_val}/locations",
+                f"https://stockist.co/api/stores/{store_id_val}/locations",
+            ]
+
             seen_ids = set()
-            while page_num <= MAX_PAGES:
-                page_url = _set_query_param(base, "page", page_num)
-                r = api.get(page_url, timeout=60_000, headers={"Referer": url})
-                print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
-                if not r.ok:
-                    break
-                # JSON puis JSONP
-                data = None
+            for base in endpoints:
                 try:
-                    data = r.json()
-                except Exception:
-                    txt = r.text()
-                    m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
-                    if m:
-                        data = json.loads(m.group(1))
-                if data is None:
-                    break
-                locs = _extract_locations(data)
-                print(f"[SCRAPER] page {page_num}: {len(locs)} items")
-                if not locs:
-                    break
-                for loc in locs:
-                    loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
-                    if loc_id in seen_ids:
-                        continue
-                    seen_ids.add(loc_id)
-                    local_rows.append(_mk_row(loc))
-                page_num += 1
-                time.sleep(0.12)
+                    per_page = 100
+                    page_num = 1
+                    got_any = False
+                    while page_num <= MAX_PAGES:
+                        page_url = _set_query_param(_set_query_param(base, "per_page", per_page), "page", page_num)
+                        r = api.get(page_url, timeout=60_000, headers={"Referer": url})
+                        print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
+                        if not r.ok:
+                            break
+                        data = None
+                        try:
+                            data = r.json()
+                        except Exception:
+                            txt = r.text()
+                            m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
+                            if m:
+                                data = json.loads(m.group(1))
+                        if data is None:
+                            break
+                        locs = _extract_locations(data)
+                        print(f"[SCRAPER] page {page_num}: {len(locs)} items")
+                        if not locs:
+                            break
+                        got_any = True
+                        for loc in locs:
+                            loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
+                            if loc_id in seen_ids:
+                                continue
+                            seen_ids.add(loc_id)
+                            local_rows.append(_mk_row(loc))
+                        page_num += 1
+                        time.sleep(0.1)
+                    if got_any:
+                        return local_rows
+                except Exception as e:
+                    print(f"[SCRAPER] endpoint failed {base}: {e}")
+                    continue
             return local_rows
 
-        if first_json_url["url"]:
-            rows = try_paginate_from(first_json_url["url"])
-        else:
-            print("[SCRAPER] Aucune première URL détectée, on tente des heuristiques…")
-            # heuristiques : prend les domaines vus et tente endpoints connus
-            tried = set()
-            for cand in stockist_candidates:
-                pr = urlparse(cand)
-                domain = f"{pr.scheme}://{pr.netloc}"
-                for path in ("/v1/locations", "/api/locations", "/locations"):
-                    base = domain + path
-                    if base in tried:
-                        continue
-                    tried.add(base)
-                    print(f"[SCRAPER][TRY] {base}")
-                    tmp = try_paginate_from(base)
-                    if tmp:
-                        rows = tmp
+        # Si on a l'ID, on passe directement par l'API
+        if store_id and str(store_id).isdigit():
+            rows = api_paginate_store(str(store_id))
+
+        # -----------------------
+        # B) Fallback : interception réseau si pas d'ID / pas de résultats
+        # -----------------------
+        if not rows:
+            print("[SCRAPER] Fallback: interception réseau/pagination générique…")
+
+            first_json_url = {"url": None}
+            def handle_response(resp):
+                try:
+                    u = (resp.url or "")
+                    lu = u.lower()
+                    if ("stockist" in lu or "stocki.st" in lu):
+                        ct = resp.headers.get('content-type','')
+                        print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={ct}")
+                        if first_json_url["url"] is None and any(k in lu for k in ("location","store","graphql","api","search")):
+                            first_json_url["url"] = u
+                            print(f"[SCRAPER] first JSON URL (candidate): {u}")
+                except Exception:
+                    pass
+
+            context.on("response", handle_response)
+
+            # petite fenêtre d’écoute
+            t0 = time.time()
+            while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
+                page.wait_for_timeout(250)
+
+            if not first_json_url["url"]:
+                # stimuler la frame
+                try:
+                    for f in page.frames:
+                        uu = (f.url or "").lower()
+                        if "stockist" in uu or "stocki.st" in uu:
+                            for _ in range(12):
+                                try:
+                                    f.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                    page.wait_for_timeout(180)
+                                except Exception:
+                                    break
+                            t1 = time.time()
+                            while (time.time() - t1) * 1000 < 5000 and not first_json_url["url"]:
+                                page.wait_for_timeout(250)
+                            break
+                except Exception:
+                    pass
+
+            # pagination générique à partir de la première URL vue
+            if first_json_url["url"]:
+                api = context.request
+                base = first_json_url["url"]
+                if "page=" not in base:
+                    base = _set_query_param(base, "page", 1)
+                base = _set_query_param(base, "per_page", 100)
+                page_num = 1
+                seen_ids = set()
+                while page_num <= MAX_PAGES:
+                    page_url = _set_query_param(base, "page", page_num)
+                    r = api.get(page_url, timeout=60_000, headers={"Referer": url})
+                    print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
+                    if not r.ok:
                         break
-                if rows:
-                    break
+                    data = None
+                    try:
+                        data = r.json()
+                    except Exception:
+                        txt = r.text()
+                        m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
+                        if m:
+                            data = json.loads(m.group(1))
+                    if data is None:
+                        break
+                    locs = _extract_locations(data)
+                    print(f"[SCRAPER] page {page_num}: {len(locs)} items")
+                    if not locs:
+                        break
+                    for loc in locs:
+                        loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
+                        if loc_id in seen_ids:
+                            continue
+                        seen_ids.add(loc_id)
+                        rows.append(_mk_row(loc))
+                    page_num += 1
+                    time.sleep(0.12)
+            else:
+                print("[SCRAPER] Aucune URL JSON capturée (widget non détecté).")
 
         browser.close()
 
-    # dédup finale
+    # Dédup & sortie
     seen, out = set(), []
     for r in rows:
         k = (r["name"].lower(), r["address_full"].lower())
-        if k in seen: 
+        if k in seen:
             continue
         seen.add(k); out.append(r)
 
