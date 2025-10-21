@@ -10,5 +10,5 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=10000
-# 1 worker gthread = +économe et compatible Playwright
+# 1 worker gthread = compatible Playwright et économe
 CMD ["gunicorn", "-w", "1", "-k", "gthread", "-b", "0.0.0.0:10000", "app:app", "--timeout", "120", "--threads", "8"]
