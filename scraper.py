@@ -93,30 +93,31 @@ def scrape_stockist(url: str):
 
         first_json_url = {"url": None}
 
+        # --- DEBUG très verbeux : journalise tout ce qui ressemble à Stockist
         def handle_response(resp):
             try:
                 u = (resp.url or "")
                 lu = u.lower()
-                # candidats: stockist, stocki.st, api.stockist.*, parfois /graphql
-                if ("stockist" in lu or "stocki.st" in lu) and any(key in lu for key in ("location","store","graphql","api")):
-                    is_json, data = _parse_json_or_jsonp(resp)
-                    if is_json and data is not None and first_json_url["url"] is None:
+                if ("stockist" in lu or "stocki.st" in lu):
+                    print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={resp.headers.get('content-type','')}")
+                    # On accepte comme "première" n'importe quel endpoint plausible
+                    if first_json_url["url"] is None and any(k in lu for k in ("location","store","graphql","api","search")):
                         first_json_url["url"] = u
-                        print(f"[SCRAPER] first JSON URL: {u}")
+                        print(f"[SCRAPER] first JSON URL (candidate): {u}")
             except Exception:
                 pass
 
         context.on("response", handle_response)
 
-        # 1) ouvrir la page (pas 'networkidle')
+        # 1) ouvrir la page
         page.goto(url, wait_until="domcontentloaded")
 
-        # 2) fenêtre d’écoute initiale
+        # 2) attendre que les requêtes partent
         t0 = time.time()
         while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
             page.wait_for_timeout(250)
 
-        # 3) stimuler la frame si besoin
+        # 3) si rien, stimuler la frame (scroll)
         if not first_json_url["url"]:
             try:
                 for f in page.frames:
@@ -129,7 +130,7 @@ def scrape_stockist(url: str):
                             except Exception:
                                 break
                         t1 = time.time()
-                        while (time.time() - t1) * 1000 < 5_000 and not first_json_url["url"]:
+                        while (time.time() - t1) * 1000 < 5000 and not first_json_url["url"]:
                             page.wait_for_timeout(250)
                         break
             except Exception:
@@ -138,41 +139,49 @@ def scrape_stockist(url: str):
         rows = []
         if first_json_url["url"]:
             api = context.request
+
+            # normaliser page & per_page
             base = first_json_url["url"]
-            # normalise page/per_page
             if "page=" not in base:
                 base = _set_query_param(base, "page", 1)
             base = _set_query_param(base, "per_page", 100)
 
             page_num = 1
             seen_ids = set()
+
             while page_num <= MAX_PAGES:
                 page_url = _set_query_param(base, "page", page_num)
                 r = api.get(page_url, timeout=60_000)
+                print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
                 if not r.ok:
-                    print(f"[SCRAPER] page {page_num}: HTTP {r.status}")
                     break
 
-                # parse JSON/JSONP au cas où
+                # JSON “pur” d'abord
+                data = None
                 try:
                     data = r.json()
                 except Exception:
+                    # JSONP / JS
                     txt = r.text()
                     m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
-                    if not m:
-                        break
-                    data = json.loads(m.group(1))
+                    if m:
+                        data = json.loads(m.group(1))
+
+                if data is None:
+                    break
 
                 locs = _extract_locations(data)
                 print(f"[SCRAPER] page {page_num}: {len(locs)} items")
                 if not locs:
                     break
+
                 for loc in locs:
                     loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
                     if loc_id in seen_ids:
                         continue
                     seen_ids.add(loc_id)
                     rows.append(_mk_row(loc))
+
                 page_num += 1
                 time.sleep(0.12)
         else:
@@ -180,11 +189,11 @@ def scrape_stockist(url: str):
 
         browser.close()
 
-    # dédup
+    # dédup finale
     seen, out = set(), []
     for r in rows:
         k = (r["name"].lower(), r["address_full"].lower())
-        if k in seen: 
+        if k in seen:
             continue
         seen.add(k); out.append(r)
 
