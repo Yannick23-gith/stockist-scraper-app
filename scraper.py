@@ -78,16 +78,14 @@ def _parse_json_or_jsonp(resp):
 def scrape_stockist(url: str):
     """
     Stratégie robuste :
-      A) Essayer de détecter l'ID de boutique Stockist dans le HTML
-         (data-stockist-store, configs embarquées...)
-         Puis paginer via l'API officielle : .../api/stores/{store_id}/locations
-      B) Si on ne trouve pas l'ID, fallback sur l'ancienne méthode :
-         on écoute les réponses réseau et on reconstruit la pagination.
+      A) Essayer d'extraire l'ID de boutique Stockist (store_id) depuis la page
+         puis paginer via l'API officielle.
+      B) Sinon, fallback sur l'interception réseau + pagination générique.
     """
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"]
         )
         context = browser.new_context(
             locale="fr-FR",
@@ -99,14 +97,12 @@ def scrape_stockist(url: str):
         page.set_default_navigation_timeout(NAV_TIMEOUT)
         page.set_default_timeout(NAV_TIMEOUT)
 
-        # -----------------------
-        # A) Tenter HTML -> store_id
-        # -----------------------
+        # ---------- A) Tenter HTML -> store_id ----------
         page.goto(url, wait_until="domcontentloaded")
 
-                store_id = None
+        store_id = None
         try:
-            # 0) Essayer via les <script src="...stockist... ?store=12345">
+            # 0) <script src="...stockist... ?store=12345">
             scripts = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
             for s in scripts:
                 sl = (s or "").lower()
@@ -117,18 +113,16 @@ def scrape_stockist(url: str):
                         print(f"[SCRAPER] store_id via script src: {store_id}")
                         break
 
-            # 1) Sinon, attributs HTML usuels
+            # 1) Attributs/JSON embarqué
             if not store_id:
                 html = page.content()
-
                 m = re.search(r'data-stockist-store=["\'](\d+)["\']', html, flags=re.I)
                 if not m:
                     m = re.search(r'"store_id"\s*:\s*(\d+)', html, flags=re.I)
                 if not m:
-                    # window.stockistConfig = { store_id: 12345, ... }
                     m = re.search(r'stockist[^=]*=\s*{[^}]*store[_\s]*id["\']?\s*[:=]\s*("?)(\d+)\1', html, flags=re.I)
-
-                if m and not store_id:
+                if m:
+                    # selon la regex, le bon groupe est 1 ou 2
                     store_id = m.group(1) if m.lastindex == 1 else (m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0))
                     print(f"[SCRAPER] store_id via HTML: {store_id}")
         except Exception as e:
@@ -137,25 +131,21 @@ def scrape_stockist(url: str):
         rows = []
 
         def api_paginate_store(store_id_val: str):
-            """Pagine via endpoints officiels Stockist pour un store_id donné."""
+            """Paginer via API officielle Stockist pour un store_id donné."""
             local_rows = []
             api = context.request
-
-            # Endpoints les plus courants (on en teste plusieurs)
             endpoints = [
                 f"https://app.stockist.co/api/stores/{store_id_val}/locations",
                 f"https://stocki.st/api/stores/{store_id_val}/locations",
                 f"https://stockist.co/api/stores/{store_id_val}/locations",
             ]
-
             seen_ids = set()
             for base in endpoints:
                 try:
-                    per_page = 100
                     page_num = 1
                     got_any = False
                     while page_num <= MAX_PAGES:
-                        page_url = _set_query_param(_set_query_param(base, "per_page", per_page), "page", page_num)
+                        page_url = _set_query_param(_set_query_param(base, "per_page", 100), "page", page_num)
                         r = api.get(page_url, timeout=60_000, headers={"Referer": url})
                         print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
                         if not r.ok:
@@ -190,25 +180,23 @@ def scrape_stockist(url: str):
                     continue
             return local_rows
 
-        # Si on a l'ID, on passe directement par l'API
+        # Utiliser l'API si on a l'ID
         if store_id and str(store_id).isdigit():
             rows = api_paginate_store(str(store_id))
 
-        # -----------------------
-        # B) Fallback : interception réseau si pas d'ID / pas de résultats
-        # -----------------------
+        # ---------- B) Fallback interception réseau ----------
         if not rows:
             print("[SCRAPER] Fallback: interception réseau/pagination générique…")
-
             first_json_url = {"url": None}
+
             def handle_response(resp):
                 try:
                     u = (resp.url or "")
                     lu = u.lower()
                     if ("stockist" in lu or "stocki.st" in lu):
-                        ct = resp.headers.get('content-type','')
+                        ct = resp.headers.get('content-type', '')
                         print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={ct}")
-                        if first_json_url["url"] is None and any(k in lu for k in ("location","store","graphql","api","search")):
+                        if first_json_url["url"] is None and any(k in lu for k in ("location", "store", "graphql", "api", "search")):
                             first_json_url["url"] = u
                             print(f"[SCRAPER] first JSON URL (candidate): {u}")
                 except Exception:
@@ -216,13 +204,13 @@ def scrape_stockist(url: str):
 
             context.on("response", handle_response)
 
-            # petite fenêtre d’écoute
+            # fenêtre d’écoute
             t0 = time.time()
             while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
                 page.wait_for_timeout(250)
 
+            # stimuler une iframe stockist si besoin
             if not first_json_url["url"]:
-                # stimuler la frame
                 try:
                     for f in page.frames:
                         uu = (f.url or "").lower()
@@ -240,13 +228,13 @@ def scrape_stockist(url: str):
                 except Exception:
                     pass
 
-            # pagination générique à partir de la première URL vue
             if first_json_url["url"]:
                 api = context.request
                 base = first_json_url["url"]
                 if "page=" not in base:
                     base = _set_query_param(base, "page", 1)
                 base = _set_query_param(base, "per_page", 100)
+
                 page_num = 1
                 seen_ids = set()
                 while page_num <= MAX_PAGES:
@@ -288,7 +276,8 @@ def scrape_stockist(url: str):
         k = (r["name"].lower(), r["address_full"].lower())
         if k in seen:
             continue
-        seen.add(k); out.append(r)
+        seen.add(k)
+        out.append(r)
 
     print(f"[SCRAPER] TOTAL: {len(out)} magasins (après pagination & dédup)")
     return out
