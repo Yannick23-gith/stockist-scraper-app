@@ -1,370 +1,215 @@
 # scraper.py
-# -*- coding: utf-8 -*-
-
-import json
 import re
 import time
-from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
+import json
+import logging
+import urllib.parse as urlparse
+from typing import List, Dict, Any, Optional
 
-from playwright.sync_api import sync_playwright
+import requests
 
-# --- Réglages généraux --------------------------------------------------------
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-NAV_TIMEOUT = 45_000          # Navigation Playwright (ms)
-CAPTURE_WINDOW_MS = 8_000     # Fenêtre d'écoute réseaux (fallback)
-MAX_PAGES = 100               # Sécurité pagination API (100x100 = 10 000)
+# Deux variantes d'API qu'on rencontre chez Stockist
+ENDPOINTS = [
+    "https://app.stockist.co/api/stores/{id}/locations",
+    "https://api.stockist.co/v1/stores/{id}/locations",
+]
+
+logger = logging.getLogger("scraper")
+logger.setLevel(logging.INFO)
 
 
-# --- Petites utilitaires ------------------------------------------------------
+def _http_get(url: str, referer: Optional[str] = None, params: Optional[dict] = None) -> requests.Response:
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+    }
+    if referer:
+        headers["Referer"] = referer
+        headers["Origin"] = urlparse.urlsplit(referer).scheme + "://" + urlparse.urlsplit(referer).netloc
 
-def _set_query_param(url: str, key: str, value) -> str:
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    return resp
+
+
+def _is_digits(s: str) -> bool:
+    return s.isdigit() and len(s) >= 3
+
+
+def _extract_store_id_from_html(html: str) -> Optional[str]:
     """
-    Ajoute/remplace un paramètre de requête dans une URL (sans casser le reste).
+    Essaie plusieurs patterns pour extraire le store_id à partir du HTML.
     """
-    urlp = urlparse(url)
-    q = dict(parse_qsl(urlp.query, keep_blank_values=True))
-    q[str(key)] = str(value)
-    new_qs = urlencode(q, doseq=True)
-    return urlunparse((urlp.scheme, urlp.netloc, urlp.path, urlp.params, new_qs, urlp.fragment))
+    patterns = [
+        r'widget(?:\.min)?\.js[^"]*?[\?&]store=(\d+)',
+        r'[?&]store=(\d+)',                     # fallback très large
+        r'"store"\s*:\s*(\d+)',                 # JSON inline
+        r"'store'\s*:\s*(\d+)",
+        r'data-store-id=["\'](\d+)["\']',
+        r'data-store=["\'](\d+)["\']',
+        r'StockistSettings\s*=\s*{[^}]*"store"\s*:\s*(\d+)',
+        r'Stockist\s*=\s*{[^}]*"store"\s*:\s*(\d+)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
 
 
-def _extract_locations(data):
+def _extract_store_id(input_value: str) -> (str, Optional[str]):
     """
-    Tente d'extraire un tableau de 'locations' d'une réponse JSON,
-    en couvrant plusieurs structures courantes des APIs Stockist.
+    Retourne (store_id, referer) à partir d'une URL de store locator OU d'un store_id.
     """
-    if not data:
-        return []
+    s = input_value.strip()
+    if _is_digits(s):
+        return s, None
 
-    # 1) Réponse déjà un tableau
-    if isinstance(data, list):
-        return data
+    # Si on nous passe une URL de la forme ?store=12345 dans la query string, récupère directement
+    qs_id = None
+    try:
+        parsed = urlparse.urlsplit(s)
+        qs = urlparse.parse_qs(parsed.query)
+        if "store" in qs and qs["store"] and _is_digits(qs["store"][0]):
+            qs_id = qs["store"][0]
+    except Exception:
+        pass
 
-    # 2) Clés standard
-    for key in ("locations", "results", "items", "data", "records"):
-        if isinstance(data, dict) and key in data and isinstance(data[key], list):
-            return data[key]
+    if qs_id:
+        return qs_id, s
 
-    # 3) GraphQL-like
-    if isinstance(data, dict):
-        # "data": {"locations": [...]}
-        d = data.get("data")
-        if isinstance(d, dict):
-            for key in ("locations", "results", "items", "records"):
-                if key in d and isinstance(d[key], list):
-                    return d[key]
+    # Sinon, on télécharge le HTML pour détecter l'ID
+    logger.info("[SCRAPER] Fetch page to extract store_id: %s", s)
+    resp = _http_get(s, referer=s)
+    if not resp.ok:
+        raise RuntimeError(f"Impossible de charger la page ({resp.status_code}).")
 
-        # pagination: {"meta": {"total_pages": X}, "data": [...]} => data déjà couvert ci-dessus
-        # rien d'autre? on retourne vide.
-    return []
+    store_id = _extract_store_id_from_html(resp.text)
+    if not store_id:
+        raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
+
+    logger.info("[SCRAPER] store_id=%s", store_id)
+    return store_id, s
 
 
-def _mk_row(loc: dict) -> dict:
-    """
-    Normalise un objet 'location' en un dict plat (idéal pour CSV).
-    On récolte l'essentiel (nom, adresse, ville, pays, etc.).
-    """
-    name = (
-        loc.get("name")
-        or loc.get("title")
-        or loc.get("store_name")
-        or loc.get("company")
-        or ""
-    )
+def _normalize_item(it: Dict[str, Any]) -> Dict[str, Any]:
+    def get(*keys):
+        for k in keys:
+            if k in it and it[k] is not None:
+                return it[k]
+        return ""
 
-    # Adresse
-    addr = loc.get("address") or {}
-    if isinstance(addr, dict):
-        line1 = addr.get("line1") or addr.get("address1") or addr.get("street") or ""
-        line2 = addr.get("line2") or addr.get("address2") or ""
-        city = addr.get("city") or ""
-        state = addr.get("state") or addr.get("province") or ""
-        postal = addr.get("postal_code") or addr.get("zip") or ""
-        country = addr.get("country") or ""
-    else:
-        # Parfois c'est tout plat
-        line1 = loc.get("address1") or loc.get("street") or ""
-        line2 = loc.get("address2") or ""
-        city = loc.get("city") or ""
-        state = loc.get("state") or loc.get("province") or ""
-        postal = loc.get("postal_code") or loc.get("zip") or ""
-        country = loc.get("country") or ""
+    # Certains champs diffèrent selon versions d'API
+    name = get("name", "title")
+    phone = get("phone", "telephone")
+    website = get("website", "url", "link")
+    lat = get("lat", "latitude")
+    lng = get("lng", "longitude")
+    address_full = get("address_string", "address_full", "formatted_address")
 
-    # Téléphone/site
-    phone = loc.get("phone") or loc.get("telephone") or ""
-    website = loc.get("website") or loc.get("url") or ""
-
-    # Géoloc
-    lat = loc.get("lat") or loc.get("latitude") or ""
-    lng = loc.get("lng") or loc.get("lon") or loc.get("longitude") or ""
-
-    # Texte adresse complète
-    address_full = ", ".join([x for x in [line1, line2, city, state, postal, country] if x])
+    address1 = get("address1", "address_1", "address_first_line", "address")
+    address2 = get("address2", "address_2", "address_second_line")
+    city = get("city", "locality", "town")
+    state = get("state", "region", "province")
+    postal_code = get("postal_code", "postcode", "zip")
+    country = get("country", "country_code", "country_name")
 
     return {
-        "name": name.strip(),
-        "address1": line1.strip(),
-        "address2": line2.strip(),
-        "city": city.strip(),
-        "state": state.strip(),
-        "postal_code": postal.strip(),
-        "country": country.strip(),
-        "phone": str(phone).strip(),
-        "website": website.strip(),
+        "name": name,
+        "address1": address1,
+        "address2": address2,
+        "city": city,
+        "state": state,
+        "postal_code": postal_code,
+        "country": country,
+        "phone": phone,
+        "website": website,
         "lat": lat,
         "lng": lng,
-        "address_full": address_full.strip(),
+        "address_full": address_full,
     }
 
 
-# --- Accès API direct via store_id --------------------------------------------
-
-def _scrape_via_api_store_id(store_id: str):
+def _fetch_all_locations(store_id: str, referer: Optional[str]) -> List[Dict[str, Any]]:
     """
-    Paginer l’API officielle Stockist si on connaît le store_id (fiable et rapide).
-    Essaie plusieurs domaines (varie selon les intégrations).
+    Essaye les différents endpoints + pagination.
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"],
-        )
-        context = browser.new_context(locale="fr-FR")
+    per_page = 100
+    collected: List[Dict[str, Any]] = []
 
-        endpoints = [
-            f"https://app.stockist.co/api/stores/{store_id}/locations",
-            f"https://stocki.st/api/stores/{store_id}/locations",
-            f"https://stockist.co/api/stores/{store_id}/locations",
-        ]
+    for base in ENDPOINTS:
+        url_base = base.format(id=store_id)
+        page = 1
+        collected = []
 
-        rows, seen = [], set()
-        for base in endpoints:
-            try:
-                page_num = 1
-                while page_num <= MAX_PAGES:
-                    page_url = _set_query_param(_set_query_param(base, "per_page", 100), "page", page_num)
-                    r = context.request.get(page_url, timeout=60_000)
-                    print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
-                    if not r.ok:
-                        break
+        logger.info("[SCRAPER] Try endpoint: %s", url_base)
 
-                    data = None
-                    try:
-                        data = r.json()
-                    except Exception:
-                        txt = r.text()
-                        # JSONP -> extraire les {} ou []
-                        m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
-                        if m:
-                            data = json.loads(m.group(1))
+        while True:
+            params = {"per_page": per_page, "page": page}
+            resp = _http_get(url_base, referer=referer or f"https://stocki.st/{store_id}", params=params)
 
-                    locs = _extract_locations(data) if data else []
-                    if not locs:
-                        break
-
-                    for loc in locs:
-                        lid = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
-                        if lid in seen:
-                            continue
-                        seen.add(lid)
-                        rows.append(_mk_row(loc))
-
-                    page_num += 1
-                    time.sleep(0.08)
-            except Exception as e:
-                print(f"[SCRAPER] endpoint failed {base}: {e}")
+            # Gère throttling basique
+            if resp.status_code in (429, 503):
+                time.sleep(1.5)
                 continue
 
-        browser.close()
+            if not resp.ok:
+                logger.info("[SCRAPER] %s -> %s", resp.url, resp.status_code)
+                break
 
-    # Dédup légère
-    out, s = [], set()
-    for r in rows:
-        k = (r["name"].lower(), r["address_full"].lower())
-        if k in s:
-            continue
-        s.add(k)
-        out.append(r)
-    print(f"[SCRAPER] TOTAL: {len(out)} magasins (store_id direct)")
-    return out
-
-
-# --- Scraper principal ---------------------------------------------------------
-
-def scrape_stockist(url: str):
-    """
-    Stratégie robuste :
-      1) Si 'url' est *directement* un store_id (ex: "12345"), on attaque l’API.
-      2) Sinon on ouvre la page, on tente d’extraire l’ID de boutique (store_id) depuis le HTML.
-         - si on l’a : on pagine l’API (rapide et stable)
-         - sinon : fallback interception réseau + pagination générique
-    """
-    url = (url or "").strip()
-
-    # 1) Saisie directe d'un store_id (ultra-pratique)
-    if url.isdigit():
-        return _scrape_via_api_store_id(url)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"],
-        )
-        context = browser.new_context(
-            locale="fr-FR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        page.set_default_navigation_timeout(NAV_TIMEOUT)
-        page.set_default_timeout(NAV_TIMEOUT)
-
-        print(f"[SCRAPER] goto {url}")
-        page.goto(url, wait_until="domcontentloaded")
-
-        # --- A) Essayer d'identifier store_id depuis la page ------------------
-        store_id = None
-        try:
-            # scripts <script src="...stockist... ?store=12345">
-            scripts = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
-            for s in scripts:
-                sl = (s or "").lower()
-                if "stockist" in sl and "store=" in sl:
-                    m = re.search(r"[?&]store=(\d+)", s)
-                    if m:
-                        store_id = m.group(1)
-                        print(f"[SCRAPER] store_id via script src: {store_id}")
-                        break
-
-            # tags/JSON embarqué
-            if not store_id:
-                html = page.content()
-                m = re.search(r'data-stockist-store=["\'](\d+)["\']', html, flags=re.I)
-                if not m:
-                    m = re.search(r'"store_id"\s*:\s*(\d+)', html, flags=re.I)
-                if not m:
-                    m = re.search(
-                        r'stockist[^=]*=\s*{[^}]*store[_\s]*id["\']?\s*[:=]\s*("?)(\d+)\1',
-                        html,
-                        flags=re.I,
-                    )
-                if m:
-                    store_id = m.group(1) if m.lastindex == 1 else (
-                        m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0)
-                    )
-                    print(f"[SCRAPER] store_id via HTML: {store_id}")
-        except Exception as e:
-            print(f"[SCRAPER] store_id parse error: {e}")
-
-        # --- B) Si on a un store_id -> API directe ----------------------------
-        if store_id and str(store_id).isdigit():
-            rows = _scrape_via_api_store_id(str(store_id))
-            browser.close()
-            return rows
-
-        # --- C) Fallback : interception réseau + pagination -------------------
-        print("[SCRAPER] Fallback: interception réseau/pagination générique…")
-        first_json_url = {"url": None}
-
-        def handle_response(resp):
             try:
-                u = (resp.url or "")
-                lu = u.lower()
-                if ("stockist" in lu or "stocki.st" in lu) and any(
-                    k in lu for k in ("location", "locations", "store", "graphql", "api", "search")
-                ):
-                    ct = resp.headers.get("content-type", "")
-                    print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={ct}")
-                    if first_json_url["url"] is None:
-                        first_json_url["url"] = u
-                        print(f"[SCRAPER] first JSON URL (candidate): {u}")
-            except Exception:
-                pass
+                data = resp.json()
+            except json.JSONDecodeError:
+                logger.info("[SCRAPER] JSON decode failed on page=%s", page)
+                break
 
-        context.on("response", handle_response)
+            # Les données peuvent être dans keys différentes
+            items = None
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("locations") or data.get("results") or data.get("data")
+                if items is None and "locations" in data:
+                    items = data["locations"]
 
-        # Laisser le temps au widget de pousser une requête
-        t0 = time.time()
-        while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
-            page.wait_for_timeout(250)
+            if not items:
+                if page == 1:
+                    logger.info("[SCRAPER] Empty payload on first page.")
+                break
 
-        # S'il est dans une iframe : scroller un peu pour le déclencher
-        if not first_json_url["url"]:
-            try:
-                for f in page.frames:
-                    uu = (f.url or "").lower()
-                    if "stockist" in uu or "stocki.st" in uu:
-                        for _ in range(10):
-                            try:
-                                f.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                page.wait_for_timeout(180)
-                            except Exception:
-                                break
-                        t1 = time.time()
-                        while (time.time() - t1) * 1000 < 5000 and not first_json_url["url"]:
-                            page.wait_for_timeout(250)
-                        break
-            except Exception:
-                pass
+            logger.info("[SCRAPER] page=%s -> %s items", page, len(items))
+            collected.extend(items)
 
-        rows = []
-        if first_json_url["url"]:
-            api = context.request
-            base = first_json_url["url"]
+            if len(items) < per_page:
+                break
+            page += 1
 
-            # Normaliser la pagination
-            if "page=" not in base:
-                base = _set_query_param(base, "page", 1)
-            base = _set_query_param(base, "per_page", 100)
+        if collected:
+            # Si on a trouvé sur un endpoint, on sort
+            break
 
-            page_num = 1
-            seen_ids = set()
-            while page_num <= MAX_PAGES:
-                page_url = _set_query_param(base, "page", page_num)
-                r = api.get(page_url, timeout=60_000, headers={"Referer": url})
-                print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
-                if not r.ok:
-                    break
+    return collected
 
-                data = None
-                try:
-                    data = r.json()
-                except Exception:
-                    txt = r.text()
-                    m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
-                    if m:
-                        data = json.loads(m.group(1))
 
-                locs = _extract_locations(data) if data else []
-                print(f"[SCRAPER] page {page_num}: {len(locs)} items")
-                if not locs:
-                    break
+def scrape_stockist(input_value: str) -> List[Dict[str, Any]]:
+    """
+    Point d'entrée appelé par app.py
+    - input_value : URL du store locator OU store_id numérique
+    - retourne une liste de dicts normalisés
+    """
+    store_id, referer = _extract_store_id(input_value)
+    raw_items = _fetch_all_locations(store_id, referer)
 
-                for loc in locs:
-                    lid = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
-                    if lid in seen_ids:
-                        continue
-                    seen_ids.add(lid)
-                    rows.append(_mk_row(loc))
+    if not raw_items:
+        raise RuntimeError(
+            "Aucun point de vente renvoyé par l’API Stockist. "
+            "Vérifie le store_id et que la page utilise bien Stockist."
+        )
 
-                page_num += 1
-                time.sleep(0.1)
-        else:
-            print("[SCRAPER] Aucune URL JSON capturée (widget non détecté).")
-
-        browser.close()
-
-    # Dédup finale
-    out, seen = [], set()
-    for r in rows:
-        k = (r["name"].lower(), r["address_full"].lower())
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(r)
-
-    print(f"[SCRAPER] TOTAL: {len(out)} magasins (fallback)")
-    return out
+    rows = [_normalize_item(it) for it in raw_items]
+    logger.info("[SCRAPER] total rows = %s", len(rows))
+    return rows
