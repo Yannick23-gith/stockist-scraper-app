@@ -63,67 +63,102 @@ def _extract_store_id_from_html(html: str) -> Optional[str]:
 
 import re
 import requests
+import asyncio
+from contextlib import asynccontextmanager
 
 UA = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 }
 
-def _extract_store_id(input_value: str) -> tuple[str, str | None]:
-    """
-    Retourne (store_id, referer).
-    - Si l'entrée est déjà un ID numérique -> on le renvoie direct.
-    - Sinon on télécharge la page et on cherche le store_id dans plein d'endroits possibles.
-    """
-    input_value = (input_value or "").strip()
-
-    # 1) Si c’est déjà un ID (ex: "53141635251")
-    if re.fullmatch(r"\d{5,}", input_value):
-        return input_value, None
-
-    # 2) Sinon, on considère que c'est une URL — on récupère l'HTML
-    try:
-        resp = requests.get(input_value, headers=UA, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Impossible de charger l'URL fournie : {e}")
-
-    html = resp.text
-
-    # 3) Tous les patterns plausibles rencontrés sur les intégrations Stockist
+# ---------- 1) Détection par requête simple (rapide)
+def _extract_store_id_fast(html: str) -> str | None:
     patterns = [
-        # Attributs data-*
         r'data-stockist-store=["\'](\d+)["\']',
         r'data-stockist_store_id=["\'](\d+)["\']',
         r'data-store-id=["\'](\d+)["\']',
-
-        # Variables JS usuelles
         r'stockist_store_id\s*[:=]\s*["\']?(\d+)',
         r'storeId\s*[:=]\s*["\']?(\d+)',
         r'stockist\s*=\s*{[^}]*store_id\s*:\s*(\d+)',
         r'stockistSettings\s*=\s*{[^}]*store_id\s*:\s*(\d+)',
         r'window\.stockistConfig\s*=\s*{[^}]*store_id\s*[:=]\s*["\']?(\d+)',
-
-        # URLs d’API/iframe/script où l’ID est présent
         r'stockist-api\.stockist\.co/[^"\']*?/(\d+)/locations',
         r'stockist\.co/[^"\']*?/(\d+)/locations',
         r'stockist\.co/[^"\']*?store_id=(\d+)',
         r'storelocator\.stockist\.co/[^"\']*?store_id=(\d+)',
         r'embed\.js[^"\']*?(?:\?|&)store_id=(\d+)',
+        r'<(?:script|iframe)[^>]+src=["\'][^"\']*(?:store_id|storeId)=(\d+)',
     ]
-
     for pat in patterns:
         m = re.search(pat, html, re.I | re.S)
         if m:
-            store_id = m.group(1)
-            return store_id, input_value  # referer = la page d’origine
+            return m.group(1)
+    return None
 
-    # 4) Dernier recours : regarder tous les <script src="…"> et iframes
-    #    -> parfois l’ID n’est visible que dans l’URL des assets
-    m = re.search(r'<(?:script|iframe)[^>]+src=["\'][^"\']*(?:store_id|storeId)=(\d+)', html, re.I)
-    if m:
-        return m.group(1), input_value
+# ---------- 2) Fallback Playwright (DOM rendu)
+@asynccontextmanager
+async def _browser():
+    from playwright.async_api import async_playwright
+    p = await async_playwright().start()
+    try:
+        browser = await p.chromium.launch(args=["--no-sandbox","--disable-dev-shm-usage"], headless=True)
+        context = await browser.new_context(
+            user_agent=UA["User-Agent"],
+            viewport={"width":1200,"height":900},
+        )
+        yield context
+    finally:
+        try:
+            await context.close()
+        except Exception:
+            pass
+        await p.stop()
+
+async def _extract_store_id_slow(url: str) -> str | None:
+    async with _browser() as ctx:
+        page = await ctx.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=45_000)
+        # On attend un petit peu que le widget Stockist s’initialise
+        try:
+            await page.wait_for_timeout(1500)
+        except Exception:
+            pass
+        html = await page.content()
+        return _extract_store_id_fast(html)
+
+def _extract_store_id(input_value: str) -> tuple[str, str | None]:
+    """
+    Retourne (store_id, referer).
+    - Si input = ID numérique, on le renvoie directement.
+    - Sinon on télécharge l'HTML (requests). Si échec -> fallback Playwright.
+    """
+    input_value = (input_value or "").strip()
+
+    # cas ID direct
+    if re.fullmatch(r"\d{5,}", input_value):
+        return input_value, None
+
+    # tentative rapide
+    try:
+        r = requests.get(input_value, headers=UA, timeout=20)
+        r.raise_for_status()
+        store_id = _extract_store_id_fast(r.text)
+        if store_id:
+            return store_id, input_value
+    except Exception:
+        # on tente le fallback directement
+        pass
+
+    # fallback Playwright (DOM rendu)
+    try:
+        store_id = asyncio.run(_extract_store_id_slow(input_value))
+        if store_id:
+            return store_id, input_value
+    except Exception as e:
+        # on laisse remonter ci-dessous
+        err = e
 
     raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
+
 
 
 
