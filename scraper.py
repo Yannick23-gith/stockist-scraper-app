@@ -92,15 +92,17 @@ def scrape_stockist(url: str):
         page.set_default_timeout(NAV_TIMEOUT)
 
         first_json_url = {"url": None}
+        stockist_candidates = []
 
-        # --- DEBUG très verbeux : journalise tout ce qui ressemble à Stockist
         def handle_response(resp):
             try:
                 u = (resp.url or "")
                 lu = u.lower()
                 if ("stockist" in lu or "stocki.st" in lu):
-                    print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={resp.headers.get('content-type','')}")
-                    # On accepte comme "première" n'importe quel endpoint plausible
+                    ct = resp.headers.get('content-type','')
+                    print(f"[SCRAPER][CANDIDATE] {resp.status} {u} CT={ct}")
+                    stockist_candidates.append(u)
+                    # première URL exploitable
                     if first_json_url["url"] is None and any(k in lu for k in ("location","store","graphql","api","search")):
                         first_json_url["url"] = u
                         print(f"[SCRAPER] first JSON URL (candidate): {u}")
@@ -112,12 +114,12 @@ def scrape_stockist(url: str):
         # 1) ouvrir la page
         page.goto(url, wait_until="domcontentloaded")
 
-        # 2) attendre que les requêtes partent
+        # 2) laisser partir les requêtes
         t0 = time.time()
         while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
             page.wait_for_timeout(250)
 
-        # 3) si rien, stimuler la frame (scroll)
+        # 3) stimuler une éventuelle iframe stockist
         if not first_json_url["url"]:
             try:
                 for f in page.frames:
@@ -137,55 +139,69 @@ def scrape_stockist(url: str):
                 pass
 
         rows = []
-        if first_json_url["url"]:
-            api = context.request
 
-            # normaliser page & per_page
-            base = first_json_url["url"]
+        def try_paginate_from(base_url: str):
+            """Essaie de paginer sur base_url en ajoutant page & per_page."""
+            local_rows = []
+            api = context.request
+            base = base_url
             if "page=" not in base:
                 base = _set_query_param(base, "page", 1)
             base = _set_query_param(base, "per_page", 100)
-
             page_num = 1
             seen_ids = set()
-
             while page_num <= MAX_PAGES:
                 page_url = _set_query_param(base, "page", page_num)
-                r = api.get(page_url, timeout=60_000)
+                r = api.get(page_url, timeout=60_000, headers={"Referer": url})
                 print(f"[SCRAPER] GET {page_url} -> HTTP {r.status}")
                 if not r.ok:
                     break
-
-                # JSON “pur” d'abord
+                # JSON puis JSONP
                 data = None
                 try:
                     data = r.json()
                 except Exception:
-                    # JSONP / JS
                     txt = r.text()
                     m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
                     if m:
                         data = json.loads(m.group(1))
-
                 if data is None:
                     break
-
                 locs = _extract_locations(data)
                 print(f"[SCRAPER] page {page_num}: {len(locs)} items")
                 if not locs:
                     break
-
                 for loc in locs:
                     loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
                     if loc_id in seen_ids:
                         continue
                     seen_ids.add(loc_id)
-                    rows.append(_mk_row(loc))
-
+                    local_rows.append(_mk_row(loc))
                 page_num += 1
                 time.sleep(0.12)
+            return local_rows
+
+        if first_json_url["url"]:
+            rows = try_paginate_from(first_json_url["url"])
         else:
-            print("[SCRAPER] Aucune URL JSON capturée (widget non détecté).")
+            print("[SCRAPER] Aucune première URL détectée, on tente des heuristiques…")
+            # heuristiques : prend les domaines vus et tente endpoints connus
+            tried = set()
+            for cand in stockist_candidates:
+                pr = urlparse(cand)
+                domain = f"{pr.scheme}://{pr.netloc}"
+                for path in ("/v1/locations", "/api/locations", "/locations"):
+                    base = domain + path
+                    if base in tried:
+                        continue
+                    tried.add(base)
+                    print(f"[SCRAPER][TRY] {base}")
+                    tmp = try_paginate_from(base)
+                    if tmp:
+                        rows = tmp
+                        break
+                if rows:
+                    break
 
         browser.close()
 
@@ -193,7 +209,7 @@ def scrape_stockist(url: str):
     seen, out = set(), []
     for r in rows:
         k = (r["name"].lower(), r["address_full"].lower())
-        if k in seen:
+        if k in seen: 
             continue
         seen.add(k); out.append(r)
 
