@@ -104,29 +104,35 @@ def scrape_stockist(url: str):
         # -----------------------
         page.goto(url, wait_until="domcontentloaded")
 
-        store_id = None
+                store_id = None
         try:
-            # 1) Attributs data-stockist-* usuels
-            html = page.content()
-            # data-stockist-store="12345"
-            m = re.search(r'data-stockist-store=["\'](\d+)["\']', html, flags=re.I)
-            if not m:
-                # certaines intégrations mettent l'id directement sur un container
-                m = re.search(r'"store_id"\s*:\s*(\d+)', html, flags=re.I)
-            if not m:
-                # cas JSON embarqué : window.stockistConfig = { store_id: 12345, ... }
-                m = re.search(r'stockist[^=]*=\s*{[^}]*store[_\s]*id["\']?\s*[:=]\s*("?)(\d+)\1', html, flags=re.I)
-            if m:
-                store_id = m.group(1) if m.lastindex == 1 else (m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0))
-                if isinstance(store_id, str) and not store_id.isdigit():
-                    # si group(1) était le guillemet, reprendre l'autre groupe
-                    try:
-                        store_id = m.group(2)
-                    except Exception:
-                        pass
-                print(f"[SCRAPER] store_id trouvé dans HTML: {store_id}")
-        except Exception:
-            pass
+            # 0) Essayer via les <script src="...stockist... ?store=12345">
+            scripts = page.eval_on_selector_all("script[src]", "els => els.map(e => e.src)")
+            for s in scripts:
+                sl = (s or "").lower()
+                if "stockist" in sl and "store=" in sl:
+                    m = re.search(r"[?&]store=(\d+)", s)
+                    if m:
+                        store_id = m.group(1)
+                        print(f"[SCRAPER] store_id via script src: {store_id}")
+                        break
+
+            # 1) Sinon, attributs HTML usuels
+            if not store_id:
+                html = page.content()
+
+                m = re.search(r'data-stockist-store=["\'](\d+)["\']', html, flags=re.I)
+                if not m:
+                    m = re.search(r'"store_id"\s*:\s*(\d+)', html, flags=re.I)
+                if not m:
+                    # window.stockistConfig = { store_id: 12345, ... }
+                    m = re.search(r'stockist[^=]*=\s*{[^}]*store[_\s]*id["\']?\s*[:=]\s*("?)(\d+)\1', html, flags=re.I)
+
+                if m and not store_id:
+                    store_id = m.group(1) if m.lastindex == 1 else (m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(0))
+                    print(f"[SCRAPER] store_id via HTML: {store_id}")
+        except Exception as e:
+            print(f"[SCRAPER] store_id parse error: {e}")
 
         rows = []
 
