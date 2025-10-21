@@ -3,9 +3,9 @@ from playwright.sync_api import sync_playwright
 import re, time, json
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-NAV_TIMEOUT = 120_000         # navigation prudente
-CAPTURE_WINDOW_MS = 30_000    # écoute initiale pour récupérer 1ère URL JSON
-MAX_PAGES = 200               # plafond de sécurité
+NAV_TIMEOUT = 120_000
+CAPTURE_WINDOW_MS = 45_000
+MAX_PAGES = 250
 
 def _norm(s): 
     return (s or "").strip()
@@ -49,12 +49,31 @@ def _extract_locations(data):
     return out
 
 def _set_query_param(u, key, value):
-    """Retourne l'URL u en remplaçant/ajoutant le paramètre key=value."""
-    parsed = urlparse(u)
-    q = parse_qs(parsed.query)
+    p = urlparse(u)
+    q = parse_qs(p.query)
     q[key] = [str(value)]
     new_q = urlencode({k: v[0] for k, v in q.items()})
-    return urlunparse(parsed._replace(query=new_q))
+    return urlunparse(p._replace(query=new_q))
+
+def _parse_json_or_jsonp(resp):
+    """
+    Renvoie (is_json, data) où data est un dict/list si parse OK.
+    Supporte JSON pur ou JSONP: callback_name({...});
+    """
+    try:
+        ct = resp.headers.get("content-type","").lower()
+        body = resp.text()  # text pour gérer JSONP
+        # JSON direct ?
+        if "json" in ct or body.strip().startswith(("{","[")):
+            return True, resp.json()
+        # JSONP / javascript
+        if "javascript" in ct or "(" in body:
+            m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", body)
+            if m:
+                return True, json.loads(m.group(1))
+    except Exception:
+        pass
+    return False, None
 
 def scrape_stockist(url: str):
     with sync_playwright() as p:
@@ -76,39 +95,39 @@ def scrape_stockist(url: str):
 
         def handle_response(resp):
             try:
-                u = (resp.url or "").lower()
-                ct = resp.headers.get("content-type","").lower()
-                if first_json_url["url"] is None and (("stocki.st" in u) or ("stockist" in u)) and ("json" in ct or u.endswith(".json")):
-                    first_json_url["url"] = resp.url  # garder l’URL EXACTE
-                    # log utile
-                    print(f"[SCRAPER] first JSON URL: {first_json_url['url']}")
+                u = (resp.url or "")
+                lu = u.lower()
+                # candidats: stockist, stocki.st, api.stockist.*, parfois /graphql
+                if ("stockist" in lu or "stocki.st" in lu) and any(key in lu for key in ("location","store","graphql","api")):
+                    is_json, data = _parse_json_or_jsonp(resp)
+                    if is_json and data is not None and first_json_url["url"] is None:
+                        first_json_url["url"] = u
+                        print(f"[SCRAPER] first JSON URL: {u}")
             except Exception:
                 pass
 
-        # capter aussi les frames
         context.on("response", handle_response)
 
         # 1) ouvrir la page (pas 'networkidle')
         page.goto(url, wait_until="domcontentloaded")
 
-        # 2) laisser le widget faire au moins 1 requête JSON
+        # 2) fenêtre d’écoute initiale
         t0 = time.time()
         while (time.time() - t0) * 1000 < CAPTURE_WINDOW_MS and not first_json_url["url"]:
             page.wait_for_timeout(250)
 
-        # 3) si rien capté, tenter de stimuler une iframe stockist
+        # 3) stimuler la frame si besoin
         if not first_json_url["url"]:
             try:
                 for f in page.frames:
                     uu = (f.url or "").lower()
-                    if "stocki.st" in uu or "stockist" in uu or "stockist.co" in uu:
-                        for _ in range(10):
+                    if "stockist" in uu or "stocki.st" in uu:
+                        for _ in range(12):
                             try:
                                 f.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                page.wait_for_timeout(150)
+                                page.wait_for_timeout(180)
                             except Exception:
                                 break
-                        # petite fenêtre d’écoute supplémentaire
                         t1 = time.time()
                         while (time.time() - t1) * 1000 < 5_000 and not first_json_url["url"]:
                             page.wait_for_timeout(250)
@@ -116,60 +135,58 @@ def scrape_stockist(url: str):
             except Exception:
                 pass
 
-        # 4) Paginer côté API à partir de la première URL trouvée
         rows = []
         if first_json_url["url"]:
-            api = context.request  # même contexte (cookies, referer…)
+            api = context.request
+            base = first_json_url["url"]
+            # normalise page/per_page
+            if "page=" not in base:
+                base = _set_query_param(base, "page", 1)
+            base = _set_query_param(base, "per_page", 100)
+
             page_num = 1
             seen_ids = set()
-
-            # Essayer de détecter le paramètre 'page' et 'per_page'
-            base_url = first_json_url["url"]
-            # s'il n’y a pas page, on l’ajoute
-            if "page=" not in base_url:
-                base_url = _set_query_param(base_url, "page", page_num)
-            # assurer un per_page correct si présent (100 max souvent)
-            if "per_page=" in base_url:
-                base_url = _set_query_param(base_url, "per_page", 100)
-
             while page_num <= MAX_PAGES:
-                page_url = _set_query_param(base_url, "page", page_num)
+                page_url = _set_query_param(base, "page", page_num)
                 r = api.get(page_url, timeout=60_000)
-                if r.ok:
-                    try:
-                        data = r.json()
-                    except Exception:
-                        break
-                    locs = _extract_locations(data)
-                    print(f"[SCRAPER] page {page_num}: {len(locs)} items")
-                    if not locs:
-                        break
-                    for loc in locs:
-                        # essaye d'utiliser un id si fourni
-                        loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
-                        if loc_id in seen_ids:
-                            continue
-                        seen_ids.add(loc_id)
-                        rows.append(_mk_row(loc))
-                    page_num += 1
-                    # petite pause anti-rate limit
-                    time.sleep(0.15)
-                else:
-                    # fin/pas d'autres pages ou rate limit
+                if not r.ok:
+                    print(f"[SCRAPER] page {page_num}: HTTP {r.status}")
                     break
+
+                # parse JSON/JSONP au cas où
+                try:
+                    data = r.json()
+                except Exception:
+                    txt = r.text()
+                    m = re.search(r"\(\s*({[\s\S]*}|[\[\s\S]*?)\)\s*;?\s*$", txt)
+                    if not m:
+                        break
+                    data = json.loads(m.group(1))
+
+                locs = _extract_locations(data)
+                print(f"[SCRAPER] page {page_num}: {len(locs)} items")
+                if not locs:
+                    break
+                for loc in locs:
+                    loc_id = loc.get("id") or loc.get("location_id") or json.dumps(loc, sort_keys=True)[:80]
+                    if loc_id in seen_ids:
+                        continue
+                    seen_ids.add(loc_id)
+                    rows.append(_mk_row(loc))
+                page_num += 1
+                time.sleep(0.12)
         else:
-            print("[SCRAPER] Aucune URL JSON capturée (widget non détecté ou bloqué).")
+            print("[SCRAPER] Aucune URL JSON capturée (widget non détecté).")
 
         browser.close()
 
-    # dédup sécurité par (nom, adresse_full)
-    dedup, out = set(), []
+    # dédup
+    seen, out = set(), []
     for r in rows:
         k = (r["name"].lower(), r["address_full"].lower())
-        if k in dedup:
+        if k in seen: 
             continue
-        dedup.add(k)
-        out.append(r)
+        seen.add(k); out.append(r)
 
     print(f"[SCRAPER] TOTAL: {len(out)} magasins (après pagination & dédup)")
     return out
