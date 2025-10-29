@@ -1,243 +1,241 @@
-# scraper.py
 import os
 import re
 import csv
 import json
 import time
-import math
-import logging
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+import typing as t
+from dataclasses import dataclass
 
 import requests
 
-# -------------------------------------------------------------------
-# Logging & DEBUG
-# -------------------------------------------------------------------
-DEBUG = os.getenv("STOCKIST_DEBUG", "0") == "1"
-logger = logging.getLogger("stockist")
-logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s  %(levelname)s  %(message)s"))
-if not logger.handlers:
-    logger.addHandler(handler)
 
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
-PER_PAGE = int(os.getenv("STOCKIST_PER_PAGE", "200"))  # 200 marche souvent sur Stockist
+# -----------------------------
+# Configuration / Debug helpers
+# -----------------------------
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+STOCKIST_DEBUG = os.getenv("STOCKIST_DEBUG", "0") not in ("0", "", "false", "False", "FALSE")
+STOCKIST_ACCOUNT_ENV = os.getenv("STOCKIST_ACCOUNT", "").strip()
+
+# Fallback projet pour Piece & Love (tu peux le laisser ou le vider)
+DEFAULT_ACCOUNT = "u20439"
+
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+HTTP_TIMEOUT = 30
+PER_PAGE = 200
 
-# -------------------------------------------------------------------
-# Utils
-# -------------------------------------------------------------------
-def _log_debug(msg: str):
-    if DEBUG:
-        logger.info(f"[stockist] DEBUG: {msg}")
 
-def normalize_stockist_endpoint(ep: str) -> str:
+def _log(msg: str) -> None:
+    if STOCKIST_DEBUG:
+        print(f"[stockist] DEBUG: {msg}", flush=True)
+
+
+# -----------------------------
+# Utilitaires Stockist
+# -----------------------------
+
+def build_api_endpoint(account: str, page: int) -> str:
     """
-    Quand on capte '.../locations/overview.js', on le convertit en '.../locations.json'
-    (l'endpoint qui renvoie réellement les points de vente).
-    On gère aussi le cas '.../locations' (sans .json) : on gardera Accept: application/json.
+    Construit l'endpoint JSON paginé.
     """
-    m = re.search(r"^(https://stockist\.co/api/v1/u\d+/)locations/overview\.js", ep)
-    if m:
-        base = m.group(1)
-        fixed = base + "locations.json"
-        _log_debug(f"[NORMALIZE] {ep}  →  {fixed}")
-        return fixed
+    return f"https://stockist.co/api/v1/{account}/locations.json?page={page}&per_page={PER_PAGE}"
 
-    m2 = re.search(r"^(https://stockist\.co/api/v1/u\d+/)locations$", ep)
-    if m2:
-        _log_debug(f"[NORMALIZE] garde '{ep}' (endpoint JSON possible)")
-        return ep
 
-    return ep
+def guess_overview_script(account: str) -> str:
+    """
+    Script 'overview.js' parfois visible dans le HTML ; utile en debug.
+    """
+    return f"https://stockist.co/api/v1/{account}/locations/overview.js"
 
-def with_query(url: str, **params) -> str:
-    u = urlparse(url)
-    q = parse_qs(u.query)
-    for k, v in params.items():
-        if v is None:
-            continue
-        q[k] = [str(v)]
-    new_q = urlencode({k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in q.items()}, doseq=True)
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
-# tout en haut de scraper.py (après les imports)
-DEFAULT_ACCOUNT = "u20439"  # fallback pour Piece & Love
+# -----------------------------
+# Détection de l'ID dans le HTML
+# -----------------------------
 
-# ...
-STOCKIST_ACCOUNT = os.getenv("STOCKIST_ACCOUNT", "").strip()
+# Quelques patrons fréquemment vus dans les intégrations Stockist
+_PATTERNS = [
+    re.compile(r"https?://stockist\.co/api/v1/(u\d+)/locations", re.I),
+    re.compile(r'"account_id"\s*:\s*"(u\d+)"', re.I),
+    re.compile(r"data-account\s*=\s*\"(u\d+)\"", re.I),
+    re.compile(r"data-stockist-account\s*=\s*\"(u\d+)\"", re.I),
+]
 
-# dans scrape_stockist(url):
-def scrape_stockist(url: str) -> List[Dict[str, Any]]:
-    _log(f"[ENTRY] url={url}")
 
-    # 1) override explicite
-    if STOCKIST_ACCOUNT:
-        endpoint = build_api_from_account(STOCKIST_ACCOUNT)
-        _log(f"[OVERRIDE] STOCKIST_ACCOUNT={STOCKIST_ACCOUNT} → {endpoint}")
-        return fetch_locations_from_api(endpoint, url)
-
-    # 1-bis) fallback projet (si l'override n'est pas présent)
-    if DEFAULT_ACCOUNT:
-        endpoint = build_api_from_account(DEFAULT_ACCOUNT)
-        _log(f"[FALLBACK] DEFAULT_ACCOUNT={DEFAULT_ACCOUNT} → {endpoint}")
-        return fetch_locations_from_api(endpoint, url)
-
-    # ... le reste (détection HTML/JS) reste identique
+def find_stockist_id_in_html(html: str) -> t.Optional[str]:
+    """
+    Essaie de retrouver l'ID de compte Stockist (format u12345) dans le HTML.
+    """
+    if not html:
+        return None
+    for pat in _PATTERNS:
+        m = pat.search(html)
+        if m:
+            return m.group(1)
+    return None
 
 
 def fetch_html(url: str) -> str:
-    headers = {"User-Agent": UA}
+    """
+    Récupération simple du HTML (sans JS) — suffisant pour beaucoup d'intégrations.
+    """
+    _log(f"[STATIC] GET {url}")
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
     r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    return r.text
+    # Encodage très variable sur Shopify/WordPress, `requests` gère souvent bien
+    r.encoding = r.apparent_encoding or r.encoding
+    return r.text or ""
 
-def normalize_location(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Mappe un enregistrement Stockist en ligne CSV standardisée."""
-    # Stockist renvoie souvent ces champs (mais ça peut varier un peu selon intégration)
-    return {
-        "name": item.get("name") or item.get("title") or "",
-        "address1": item.get("address1") or item.get("address") or "",
-        "address2": item.get("address2") or "",
-        "city": item.get("city") or "",
-        "region": item.get("region") or item.get("state") or "",
-        "postal_code": item.get("postal_code") or item.get("zip") or "",
-        "country": item.get("country") or "",
-        "phone": item.get("phone") or "",
-        "website": item.get("website") or "",
-        "lat": item.get("lat") or item.get("latitude") or "",
-        "lng": item.get("lng") or item.get("longitude") or "",
-    }
 
-# -------------------------------------------------------------------
-# Cœur : collecte via l'API Stockist
-# -------------------------------------------------------------------
-def fetch_locations_from_api(api_url: str, source_url: str) -> List[Dict[str, Any]]:
-    """
-    Appelle la vraie API de données Stockist (locations.json / locations).
-    Paginate jusqu'à la fin. Retourne une liste de dicts normalisés.
-    """
-    sess = requests.Session()
-    all_rows: List[Dict[str, Any]] = []
+# -----------------------------
+# Récupération & Normalisation
+# -----------------------------
 
-    api_url = normalize_stockist_endpoint(api_url)
+@dataclass
+class NormStore:
+    name: str = ""
+    address1: str = ""
+    address2: str = ""
+    city: str = ""
+    region: str = ""
+    postal_code: str = ""
+    country: str = ""
+    phone: str = ""
+    website: str = ""
+    lat: t.Optional[float] = None
+    lng: t.Optional[float] = None
 
-    page = 1
-    while True:
-        url = with_query(api_url, page=page, per_page=PER_PAGE)
-        headers = {
-            "Accept": "application/json, */*",
-            "User-Agent": UA,
-            "Referer": source_url,
-            "Origin": f"{urlparse(source_url).scheme}://{urlparse(source_url).netloc}",
+    def to_row(self) -> dict:
+        return {
+            "name": self.name,
+            "address1": self.address1,
+            "address2": self.address2,
+            "city": self.city,
+            "region": self.region,
+            "postal_code": self.postal_code,
+            "country": self.country,
+            "phone": self.phone,
+            "website": self.website,
+            "lat": self.lat,
+            "lng": self.lng,
         }
 
-        _log_debug(f"[API] GET {url}")
-        r = sess.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
 
-        ctype = (r.headers.get("content-type") or "").lower()
+def normalize_item(item: dict) -> NormStore:
+    """
+    Adapter/renommer les champs reçus de l'API Stockist.
+    """
+    # Champs courants renvoyés par Stockist
+    name = item.get("name") or item.get("store_name") or ""
+    address1 = item.get("address1") or ""
+    address2 = item.get("address2") or ""
+    city = item.get("city") or ""
+    region = item.get("region") or item.get("state") or ""
+    postal_code = item.get("postal_code") or item.get("zip") or ""
+    country = item.get("country") or ""
+    phone = item.get("phone") or ""
+    website = item.get("website") or item.get("url") or ""
+    lat = item.get("lat") or item.get("latitude")
+    lng = item.get("lng") or item.get("longitude")
 
-        # Certains renvoient json sans header propre, on tente json sinon parse text
-        try:
-            data = r.json()
-        except json.JSONDecodeError:
-            if ctype.startswith("application/json"):
-                raise
-            # Parfois c'est du JS style "window.XXX = {...}"
-            txt = r.text.strip()
-            m = re.search(r"=\s*({.*})\s*;?\s*$", txt)
-            if m:
-                data = json.loads(m.group(1))
-            else:
-                # Dernier recours
-                data = {}
+    # Cast float si possible
+    try:
+        lat = float(lat) if lat is not None else None
+    except Exception:
+        lat = None
+    try:
+        lng = float(lng) if lng is not None else None
+    except Exception:
+        lng = None
 
-        # Formats fréquents
-        items = data.get("locations") or data.get("items")
-        if items is None:
-            # Certains renvoient directement une liste brute
-            if isinstance(data, list):
-                items = data
-            else:
-                items = []
+    return NormStore(
+        name=name,
+        address1=address1,
+        address2=address2,
+        city=city,
+        region=region,
+        postal_code=postal_code,
+        country=country,
+        phone=phone,
+        website=website,
+        lat=lat,
+        lng=lng,
+    )
 
-        _log_debug(f"[API] page={page} items={len(items)}")
 
-        for it in items:
-            all_rows.append(normalize_location(it))
+def fetch_all_locations(account: str, referer_url: str) -> t.List[dict]:
+    """
+    Récupère toutes les pages de l'API Stockist pour un compte donné.
+    """
+    rows: t.List[dict] = []
+    page = 1
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Referer": referer_url,
+    }
 
-        # Fin de pagination
-        pagination = data.get("pagination") if isinstance(data, dict) else None
-        if pagination and isinstance(pagination, dict):
-            total_pages = pagination.get("total_pages")
-            if total_pages and page >= int(total_pages):
-                break
-        else:
-            # si moins que per_page → dernier lot
-            if len(items) < PER_PAGE:
-                break
+    _log(f"[API] account={account} overview={guess_overview_script(account)}")
 
+    while True:
+        endpoint = build_api_endpoint(account, page)
+        _log(f"[API] GET {endpoint}")
+        resp = requests.get(endpoint, headers=headers, timeout=HTTP_TIMEOUT)
+        # 200 avec `[]` quand plus de données
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+
+        for itm in data:
+            rows.append(normalize_item(itm).to_row())
+        _log(f"[API] page={page} items={len(data)} total={len(rows)}")
+        if len(data) < PER_PAGE:
+            break
         page += 1
 
-    return all_rows
-
-# -------------------------------------------------------------------
-# Scrape principal (appelé par app.py)
-# -------------------------------------------------------------------
-def scrape_stockist(url: str) -> List[Dict[str, Any]]:
-    """
-    1) Essaie de trouver l'endpoint Stockist depuis la page (id uXXXXX)
-    2) Appelle l'API 'locations(.json)' paginée
-    3) Retourne les lignes normalisées
-    """
-    _log_debug(f"[ENTRY] url={url}")
-
-    html = fetch_html(url)
-
-    # 1) essaie d'extraire directement un endpoint complet dans le HTML
-    m = re.search(r"(https://stockist\.co/api/v1/u\d+/locations(?:/overview\.js)?)", html)
-    if m:
-        endpoint = m.group(1)
-        _log_debug(f"[HTML] endpoint détecté → {endpoint}")
-    else:
-        # 2) sinon, récupère l'id de compte 'uXXXXX' et reconstruis l'URL
-        acc = find_stockist_id_in_html(html)
-        if not acc:
-            raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
-        endpoint = f"https://stockist.co/api/v1/{acc}/locations.json"
-        _log_debug(f"[HTML] id détecté → {acc}  → endpoint {endpoint}")
-
-    rows = fetch_locations_from_api(endpoint, url)
-    _log_debug(f"[DONE] rows={len(rows)}")
     return rows
 
-# -------------------------------------------------------------------
-# (Optionnel) utilitaire pour écrire un CSV local si tu testes en dehors de Flask
-# -------------------------------------------------------------------
-def write_csv(path: str, rows: List[Dict[str, Any]]):
-    fieldnames = [
-        "name", "address1", "address2", "city", "region",
-        "postal_code", "country", "phone", "website", "lat", "lng"
-    ]
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
+# -----------------------------
+# Fonction principale
+# -----------------------------
+
+def scrape_stockist(url: str) -> t.List[dict]:
+    """
+    Point d'entrée utilisé par ton app.
+    """
+    _log(f"[ENTRY] url={url}")
+
+    # 1) Override par variable d'env (recommandé)
+    if STOCKIST_ACCOUNT_ENV:
+        _log(f"[OVERRIDE] STOCKIST_ACCOUNT={STOCKIST_ACCOUNT_ENV}")
+        return fetch_all_locations(STOCKIST_ACCOUNT_ENV, url)
+
+    # 2) Fallback projet
+    if DEFAULT_ACCOUNT:
+        _log(f"[FALLBACK] DEFAULT_ACCOUNT={DEFAULT_ACCOUNT}")
+        return fetch_all_locations(DEFAULT_ACCOUNT, url)
+
+    # 3) Détection dans le HTML (si tu veux laisser cette voie activée)
+    html = fetch_html(url)
+    acc = find_stockist_id_in_html(html)
+    if acc:
+        _log(f"[STATIC] store_id trouvé → {acc}")
+        return fetch_all_locations(acc, url)
+
+    # Rien trouvé → on échoue de manière explicite
+    raise RuntimeError("Impossible de déterminer le store_id Stockist depuis la page.")
+
+
+# -------------
+# (Optionnel) – si tu veux tester localement :
 if __name__ == "__main__":
-    test_url = os.getenv("TEST_URL", "").strip()
-    if not test_url:
-        print("Set TEST_URL to a Stockist store-locator page to test.")
-    else:
-        rs = scrape_stockist(test_url)
-        out = os.getenv("OUT", "stores.csv")
-        write_csv(out, rs)
-        print(f"Wrote {len(rs)} rows to {out}")
+    test_url = os.getenv("TEST_URL", "https://pieceandlove.fr/pages/distributeurs")
+    out = scrape_stockist(test_url)
+    print(f"Stores: {len(out)}")
+    # Petit aperçu
+    for r in out[:3]:
+        print(r)
