@@ -351,19 +351,43 @@ def _fetch_from_store_id(store_id: str, referer: str) -> List[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 # Normalisation
 # -----------------------------------------------------------------------------
-def _normalize(loc: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_location(loc: Dict[str, Any]) -> Dict[str, Any]:
+    def g(*keys, default=""):
+        for k in keys:
+            v = loc.get(k)
+            if v not in (None, ""):
+                return v
+        return default
+
+    name = g("name", "title", "store_name")
+    address1 = g("address1", "address_1", "street", "line1", "address")
+    address2 = g("address2", "address_2", "line2")
+    city = g("city", "locality", "town")
+    state = g("state", "region", "province")
+    postal = g("postal_code", "postcode", "zip")
+    country = g("country", "country_name", "country_code")
+    phone = g("phone", "telephone", "tel")
+    website = g("website", "url", "link")
+    lat = g("lat", "latitude")
+    lng = g("lng", "lon", "longitude")
+
+    # Adresse complète pour la lisibilité et la dédup
+    parts = [address1, address2, city, state, postal, country]
+    address_full = ", ".join([p for p in parts if p])
+
     return {
-        "name": loc.get("name") or loc.get("store_name") or "",
-        "address": loc.get("address") or loc.get("street") or "",
-        "city": loc.get("city") or "",
-        "state": loc.get("state") or loc.get("province") or "",
-        "postal_code": loc.get("postal_code") or loc.get("zip") or "",
-        "country": loc.get("country") or "",
-        "phone": loc.get("phone") or "",
-        "website": loc.get("website") or loc.get("url") or "",
-        "lat": loc.get("latitude") or loc.get("lat"),
-        "lng": loc.get("longitude") or loc.get("lng"),
-        "raw": loc,
+        "name": name,
+        "address1": address1,
+        "address2": address2,
+        "city": city,
+        "state": state,
+        "postal_code": postal,
+        "country": country,
+        "phone": phone,
+        "website": website,
+        "lat": lat,
+        "lng": lng,
+        "address_full": address_full,
     }
 
 # -----------------------------------------------------------------------------
