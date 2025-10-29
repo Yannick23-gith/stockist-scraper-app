@@ -9,7 +9,7 @@ import requests
 
 STOCKIST_DEBUG = os.getenv("STOCKIST_DEBUG", "0") not in ("0", "", "false", "False", "FALSE")
 STOCKIST_ACCOUNT_ENV = os.getenv("STOCKIST_ACCOUNT", "").strip()
-DEFAULT_ACCOUNT = "u20439"  # tu peux l’enlever si tu veux forcer l’ENV
+DEFAULT_ACCOUNT = "u20439"  # optionnel : tu peux retirer si tu veux forcer l'ENV
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -99,40 +99,78 @@ def api_base(account: str) -> str:
 
 def build_candidates(account: str, page: int) -> t.List[str]:
     base = api_base(account)
-    # ordre de tentative
-    candidates = [
+    # ordre de tentative – on élargit le spectre
+    return [
         f"{base}/locations.json?page={page}&per_page={PER_PAGE}",
         f"{base}/locations?page={page}&per_page={PER_PAGE}",
         f"{base}/locations/overview.json?page={page}&per_page={PER_PAGE}",
-        # overview.js n’est pas paginé en général, mais on garde ?page pour les logs
         f"{base}/locations/overview.js?page={page}&per_page={PER_PAGE}",
+        f"{base}/locations/overview?page={page}&per_page={PER_PAGE}",
+        f"{base}/locations.js?page={page}&per_page={PER_PAGE}",
     ]
-    return candidates
+
+
+# ---------- Parseurs JS ----------
+
+LIKELY_KEYS = {"name", "store_name", "address1", "city", "country", "postal_code", "lat", "lng", "latitude", "longitude"}
+
+def looks_like_store_dict(d: dict) -> bool:
+    if not isinstance(d, dict):
+        return False
+    keys = set(d.keys())
+    return bool(keys & LIKELY_KEYS)
 
 
 def parse_overview_js(text: str) -> t.List[dict]:
     """
-    Beaucoup de comptes exposent leurs points de vente via un JS de type:
-        window.Stockist.locations = [...]
-    ou
-        Stockist.locations = [...]
-    On extrait le premier tableau JSON trouvé dans le script.
+    Heuristique: on cherche tous les tableaux de dicts du script
+    et on garde celui qui ressemble le plus à des stores.
     """
-    # Cherche un tableau JSON le plus large possible
-    # Exemples de patterns vus: "= [ ... ];", "locations:[...]", etc.
-    m = re.search(r"=\s*(\[\s*\{.*?\}\s*\])\s*;?", text, re.S)
-    if not m:
-        # fallback : array après "locations:"
-        m = re.search(r"locations\s*:\s*(\[\s*\{.*?\}\s*\])", text, re.S)
-    if not m:
-        return []
-    try:
-        arr = json.loads(m.group(1))
-        if isinstance(arr, list):
-            return arr
-    except Exception:
-        return []
-    return []
+    if STOCKIST_DEBUG:
+        _log("[JS] first 600 chars ↓")
+        _log(text[:600].replace("\n", "\\n"))
+
+    candidates: t.List[t.List[dict]] = []
+
+    # 1) Patterns ciblés
+    patterns = [
+        r"locations\s*=\s*(\[\s*\{.*?\}\s*\])\s*;?",   # Stockist.locations = [...]
+        r"=\s*(\[\s*\{.*?\}\s*\])\s*;?",              # var foo = [...]
+        r"locations\s*:\s*(\[\s*\{.*?\}\s*\])",       # locations:[...]
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.S)
+        if m:
+            try:
+                arr = json.loads(m.group(1))
+                if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                    candidates.append(arr)
+            except Exception:
+                pass
+
+    # 2) Fall-back large: toutes les séquences "[{...}]"
+    for m in re.finditer(r"\[\s*\{.*?\}\s*\]", text, re.S):
+        s = m.group(0)
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                candidates.append(arr)
+        except Exception:
+            continue
+
+    # Sélectionne la meilleure candidate (max de clés probables sur le 1er élément)
+    best: t.List[dict] = []
+    best_score = -1
+    for arr in candidates:
+        score = 0
+        for k in arr[0].keys():
+            if k in LIKELY_KEYS:
+                score += 1
+        if score > best_score:
+            best = arr
+            best_score = score
+
+    return best
 
 
 def try_fetch_endpoint(url: str, headers: dict) -> t.Tuple[bool, t.Union[list, None]]:
@@ -143,7 +181,7 @@ def try_fetch_endpoint(url: str, headers: dict) -> t.Tuple[bool, t.Union[list, N
         return False, None
     r.raise_for_status()
 
-    ct = r.headers.get("Content-Type", "")
+    ct = (r.headers.get("Content-Type") or "").lower()
     txt = r.text or ""
 
     # JSON direct ?
@@ -155,19 +193,13 @@ def try_fetch_endpoint(url: str, headers: dict) -> t.Tuple[bool, t.Union[list, N
         except Exception:
             pass
 
-    # JS overview ?
-    if url.endswith(".js"):
+    # JS (overview / autres variantes)
+    if "javascript" in ct or url.endswith(".js") or "text/html" in ct:
         data = parse_overview_js(txt)
         if data:
             return True, data
 
-    # Certains serveurs marquent overview.js "text/javascript" mais c'est OK
-    if "javascript" in ct and not url.endswith(".json"):
-        data = parse_overview_js(txt)
-        if data:
-            return True, data
-
-    # Autres cas → on tente quand même JSON
+    # Dernier essai: parse JSON quoi qu'il arrive
     try:
         data = r.json()
         if isinstance(data, list):
@@ -175,7 +207,6 @@ def try_fetch_endpoint(url: str, headers: dict) -> t.Tuple[bool, t.Union[list, N
     except Exception:
         pass
 
-    # Rien de reconnu sur cet endpoint
     _log("[API] unrecognized payload on this endpoint")
     return False, None
 
@@ -184,7 +215,7 @@ def fetch_all_locations(account: str, referer_url: str) -> t.List[dict]:
     rows: t.List[dict] = []
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "*/*",
+        "Accept": "application/json,text/javascript,application/javascript,text/html,*/*",
         "Referer": referer_url,
     }
 
@@ -202,34 +233,31 @@ def fetch_all_locations(account: str, referer_url: str) -> t.List[dict]:
                 _log(f"[API] page={page} items=0 total={total}")
                 break
 
-            # on normalise
             for itm in payload:
                 rows.append(normalize_item(itm).to_row())
 
             total = len(rows)
             _log(f"[API] page={page} items={len(payload)} total={total}")
 
-            # overview.js renvoie souvent tout en une fois → on stoppe à la 1re page
-            if endpoint.endswith(".js"):
+            # JS (overview) : souvent tout d'un bloc → stop dès la 1re page qui répond
+            if endpoint.endswith(".js") or "/overview" in endpoint:
                 return rows
 
-            # pagination API JSON : si < PER_PAGE on stoppe
+            # JSON paginé : si < PER_PAGE → terminé
             if len(payload) < PER_PAGE:
                 return rows
 
-            break  # ne pas essayer les autres patterns pour cette page
+            break  # prochaine page
 
         if not got:
-            # Aucun des endpoints n'a retourné quelque chose d'utilisable pour cette page
             if page == 1 and not rows:
                 raise requests.HTTPError(f"All endpoints 404/unsupported for account {account}.")
-            # Si on a déjà eu des données avant, on s'arrête proprement
             return rows
 
         page += 1
 
 
-# ---------- Détection de l’ID dans le HTML si besoin ----------
+# ---------- Extraction store_id dans la page ----------
 
 _PATTERNS = [
     re.compile(r"https?://stockist\.co/api/v1/(u\d+)/locations", re.I),
@@ -238,7 +266,6 @@ _PATTERNS = [
     re.compile(r"data-stockist-account\s*=\s*\"(u\d+)\"", re.I),
 ]
 
-
 def fetch_html(url: str) -> str:
     _log(f"[STATIC] GET {url}")
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
@@ -246,7 +273,6 @@ def fetch_html(url: str) -> str:
     r.raise_for_status()
     r.encoding = r.apparent_encoding or r.encoding
     return r.text or ""
-
 
 def find_stockist_id_in_html(html: str) -> t.Optional[str]:
     if not html:
@@ -264,7 +290,7 @@ def scrape_stockist(url: str) -> t.List[dict]:
     _log(f"[ENTRY] url={url}")
 
     if STOCKIST_ACCOUNT_ENV:
-        _log(f"[OVERRIDE] STOCKIST_ACCOUNT={STOCKIST_ACCOUNT_ENV}")
+        _log(f"[FALLBACK] DEFAULT_ACCOUNT={STOCKIST_ACCOUNT_ENV}")
         return fetch_all_locations(STOCKIST_ACCOUNT_ENV, url)
 
     if DEFAULT_ACCOUNT:
