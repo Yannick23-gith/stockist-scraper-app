@@ -67,22 +67,30 @@ def with_query(url: str, **params) -> str:
     new_q = urlencode({k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in q.items()}, doseq=True)
     return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
 
-def find_stockist_id_in_html(html: str) -> Optional[str]:
-    """
-    Fallback quand on n'a pas capté l'endpoint via réseau.
-    On cherche un 'uXXXXX' ou un endpoint mentionné en clair.
-    """
-    # Cherche un uXXXXX
-    m = re.search(r"/api/v1/(u\d+)/", html)
-    if m:
-        return m.group(1)
+# tout en haut de scraper.py (après les imports)
+DEFAULT_ACCOUNT = "u20439"  # fallback pour Piece & Love
 
-    # Cherche une config JS du genre Stockist
-    m2 = re.search(r"Stockist\s*=\s*{[^}]*account_id\s*:\s*['\"](u\d+)['\"]", html)
-    if m2:
-        return m2.group(1)
+# ...
+STOCKIST_ACCOUNT = os.getenv("STOCKIST_ACCOUNT", "").strip()
 
-    return None
+# dans scrape_stockist(url):
+def scrape_stockist(url: str) -> List[Dict[str, Any]]:
+    _log(f"[ENTRY] url={url}")
+
+    # 1) override explicite
+    if STOCKIST_ACCOUNT:
+        endpoint = build_api_from_account(STOCKIST_ACCOUNT)
+        _log(f"[OVERRIDE] STOCKIST_ACCOUNT={STOCKIST_ACCOUNT} → {endpoint}")
+        return fetch_locations_from_api(endpoint, url)
+
+    # 1-bis) fallback projet (si l'override n'est pas présent)
+    if DEFAULT_ACCOUNT:
+        endpoint = build_api_from_account(DEFAULT_ACCOUNT)
+        _log(f"[FALLBACK] DEFAULT_ACCOUNT={DEFAULT_ACCOUNT} → {endpoint}")
+        return fetch_locations_from_api(endpoint, url)
+
+    # ... le reste (détection HTML/JS) reste identique
+
 
 def fetch_html(url: str) -> str:
     headers = {"User-Agent": UA}
